@@ -40,9 +40,15 @@ use paused::TestClock;
 
 use std::fmt;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use primitives::{Condvar, Mutex, MutexGuard};
+
+/// Longest real wait handed to the OS in one call, since Windows waits forever
+/// on timeouts of about 49.7 days or more.
+const MAX_REAL_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A clock that reads real time, or a test's time that moves only on command.
 ///
@@ -108,7 +114,21 @@ impl Clock {
     ///
     /// On a test clock, only its advances end the sleep.
     pub fn sleep_until(&self, deadline: Instant) {
-        self.waiter().wait_until(Some(deadline), || None::<()>);
+        // A test clock's sleep parks until an advance reaches its deadline
+        #[cfg(any(test, feature = "test-clock"))]
+        if self.paused.is_some() {
+            self.waiter().wait_until(Some(deadline), || None::<()>);
+            return;
+        }
+
+        // A real sleep waits in capped slices, rechecking the deadline after each
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            std::thread::sleep((deadline - now).min(MAX_REAL_WAIT));
+        }
     }
 
     /// Returns the shared state's address, or nothing for the real clock.
@@ -178,7 +198,9 @@ impl Waiter {
     /// Blocks until `ready` returns a value or the clock reaches `deadline`.
     ///
     /// A ready value wins over an expired deadline. Without a deadline, only
-    /// a ready value ends the wait. The callback runs without crate locks held.
+    /// a ready value ends the wait. The callback runs again after every
+    /// notification and once the deadline is reached, without crate locks held.
+    #[cfg(any(test, feature = "test-clock"))]
     fn wait_until<T>(
         &self,
         deadline: Option<Instant>,
@@ -189,8 +211,8 @@ impl Waiter {
 
         // Check and park in turns, until a value arrives or the deadline passes
         loop {
-            // Take the generation before checking, so a change after the check cuts the park short
-            let seen = self.signal.generation();
+            // Read the count before checking, so a notification during the check ends the park at once
+            let seen = self.signal.lock().notifications;
             if let Some(value) = ready() {
                 return Some(value);
             }
@@ -211,10 +233,12 @@ impl Waiter {
         deadline
     }
 
-    /// Parks until the generation moves on from `seen` or the clock reaches
-    /// `deadline`, and returns the state locked again.
+    /// Parks until the notification count moves past `seen` or the clock
+    /// reaches `deadline`, and returns the state locked again.
     ///
-    /// Only a real clock's park uses a real timer. In tests, one-shot hooks run
+    /// On a test clock, the park counts as blocked and lists its deadline from
+    /// its first wait until it returns, however often it wakes in between. Only
+    /// a real clock's park uses a real timer. In tests, one-shot hooks run
     /// before its first wait and before a wait after a spurious wakeup, with
     /// the signal unlocked.
     fn park<'a>(
@@ -224,14 +248,14 @@ impl Waiter {
         deadline: Option<Instant>,
         timer: Option<Instant>,
     ) -> MutexGuard<'a, SignalState> {
-        // Count the park once, keeping it counted through spurious wakeups
+        // Count the park once, keeping it counted through every wakeup until it returns
         #[cfg(any(test, feature = "test-clock"))]
         let mut blocked = None;
 
         loop {
-            // Stop once the generation moves or the clock reaches the deadline
+            // Stop once a notification arrives or the clock reaches the deadline
             let now = self.clock.now();
-            if state.generation != seen || deadline.is_some_and(|deadline| now >= deadline) {
+            if state.notifications != seen || deadline.is_some_and(|deadline| now >= deadline) {
                 break;
             }
 
@@ -249,15 +273,16 @@ impl Waiter {
                 continue;
             }
 
-            // Count the park while the signal is locked, so that an advance seen after
-            // the count still wakes it
+            // Count the park under the clock lock, so an advance either finds it or has
+            // already passed its deadline
             #[cfg(any(test, feature = "test-clock"))]
             if blocked.is_none() {
-                blocked = self
-                    .clock
-                    .paused
-                    .as_ref()
-                    .map(|paused| paused.block(deadline));
+                if let Some(paused) = &self.clock.paused {
+                    blocked = paused.block(deadline, &self.signal);
+                    if blocked.is_none() {
+                        break;
+                    }
+                }
             }
             #[cfg(test)]
             {
@@ -275,7 +300,7 @@ impl Waiter {
                 Some(timer) => {
                     self.signal
                         .changed
-                        .wait_timeout(state, timer - now)
+                        .wait_timeout(state, (timer - now).min(MAX_REAL_WAIT))
                         .expect("waiter signal not poisoned")
                         .0
                 }
@@ -308,26 +333,29 @@ impl fmt::Debug for Waiter {
     }
 }
 
-/// Wakes threads through a generation read before each condition check.
+/// Counts notifications and wakes parked threads to recheck their condition
+/// or deadline.
 #[derive(Default)]
 struct Signal {
-    /// Counters and the test park count, guarded together.
+    /// Notification count and the test park count, guarded together.
     state: Mutex<SignalState>,
-    /// Wakes parked threads when the generation moves.
+    /// Wakes parked threads for a notification or a reached deadline.
     changed: Condvar,
     /// Reports new parks to tests, without waking parked threads.
     #[cfg(test)]
     parked: Condvar,
+    /// Clock wakes delivered, so tests can check which waits an advance reached.
+    #[cfg(test)]
+    wakes: AtomicUsize,
 }
 
 /// Mutable part of a signal.
 #[derive(Default)]
 struct SignalState {
-    /// Number of notifications and clock advances, wrapping on overflow.
-    generation: u64,
-    /// Number of notifications alone, which end condvar waits, wrapping on overflow.
+    /// Notifications sent so far, wrapping on overflow, which each waiter
+    /// compares with the count it read before parking.
     notifications: u64,
-    /// Total parks that found the generation unchanged, for test synchronization.
+    /// Total waits entered, for test synchronization.
     #[cfg(test)]
     parks: usize,
 }
@@ -338,9 +366,10 @@ impl Signal {
         self.state.lock().expect("waiter signal not poisoned")
     }
 
-    /// Returns the current generation, to compare against when parking.
-    fn generation(&self) -> u64 {
-        self.lock().generation
+    /// Identifies this signal in the test clock's registrations and parked deadlines.
+    #[cfg(any(test, feature = "test-clock"))]
+    fn key(&self) -> usize {
+        self as *const Self as usize
     }
 
     /// Counts a notification and wakes one parked thread.
@@ -349,7 +378,6 @@ impl Signal {
     /// as a spurious wakeup, the next time it wakes.
     fn notify_one(&self) {
         let mut state = self.lock();
-        state.generation = state.generation.wrapping_add(1);
         state.notifications = state.notifications.wrapping_add(1);
         self.changed.notify_one();
     }
@@ -357,16 +385,18 @@ impl Signal {
     /// Counts a notification and wakes every parked thread.
     fn notify_all(&self) {
         let mut state = self.lock();
-        state.generation = state.generation.wrapping_add(1);
         state.notifications = state.notifications.wrapping_add(1);
         self.changed.notify_all();
     }
 
     /// Wakes every parked thread to recheck the time, without counting a notification.
     #[cfg(any(test, feature = "test-clock"))]
-    fn advance(&self) {
-        let mut state = self.lock();
-        state.generation = state.generation.wrapping_add(1);
+    fn wake(&self) {
+        #[cfg(test)]
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+
+        // Take the lock, so a park that read the time before the advance is waiting by now
+        let _state = self.lock();
         self.changed.notify_all();
     }
 }

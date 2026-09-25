@@ -6,7 +6,9 @@
 
 //! Checks clock control, sleep races and the internal eventcount contract.
 
-use super::helpers::{blocked, last_system_time, pause_before_park, pause_before_rewait};
+use super::helpers::{
+    blocked, last_system_time, pause_before_park, pause_before_rewait, signals, wakes,
+};
 use crate::{Clock, TestClock, Waiter};
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
@@ -267,41 +269,6 @@ fn test_sleep_observes_advance_before_parking() {
     }
 }
 
-// A partial advance makes both sleep methods park again, without changing
-// their original deadline.
-#[test]
-fn test_sleep_reparks_after_partial_advance() {
-    for until in [false, true] {
-        // Start a sleeper and wait until it parks
-        let mut tester = TestClock::new();
-        let clock = tester.clock();
-        let deadline = clock.now() + Duration::from_secs(5);
-        let waiting = thread::spawn({
-            let clock = clock.clone();
-            move || {
-                if until {
-                    clock.sleep_until(deadline);
-                } else {
-                    clock.sleep(Duration::from_secs(5));
-                }
-                clock.now()
-            }
-        });
-        tester.wait_blocked(1);
-
-        // Advance short of the deadline and catch the sleeper on its way back to park
-        let (checked, resume) = pause_before_park(&clock);
-        tester.advance(Duration::from_secs(2));
-        assert_eq!(checked.recv().unwrap(), None, "{until}");
-        resume.send(()).unwrap();
-
-        // Parked again, it wakes only once the original deadline is reached
-        tester.wait_blocked(1);
-        tester.advance_to(deadline);
-        assert_eq!(waiting.join().unwrap(), deadline, "{until}");
-    }
-}
-
 // An advance wakes every parked sleeper across cloned handles and releases
 // their registrations and counts.
 #[test]
@@ -354,10 +321,10 @@ fn test_sleep_returns_for_reached_deadlines() {
     }
 }
 
-// Wall jumps and zero advances leave monotonic time and parked sleepers' generations untouched.
+// Wall jumps and zero advances leave monotonic time in place and wake no parked sleeper.
 #[test]
 fn test_wall_jumps_and_zero_advances_do_not_wake() {
-    // Park a waiter three seconds ahead of its deadline and note its generation
+    // Park a waiter three seconds ahead of its deadline
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let now = clock.now();
@@ -367,7 +334,6 @@ fn test_wall_jumps_and_zero_advances_do_not_wake() {
         move || waiter.wait_until(Some(now + Duration::from_secs(3)), || None::<()>)
     });
     tester.wait_blocked(1);
-    let seen = waiter.signal.generation();
 
     // Wall jumps and advances that leave monotonic time in place do not wake it
     for seconds in [100, 50] {
@@ -377,7 +343,7 @@ fn test_wall_jumps_and_zero_advances_do_not_wake() {
         tester.advance_to(now);
         assert_eq!(clock.now(), now, "{seconds}");
         assert_eq!(clock.system_time(), wall, "{seconds}");
-        assert_eq!(waiter.signal.generation(), seen, "{seconds}");
+        assert_eq!(wakes(&waiter.signal), 0, "{seconds}");
     }
 
     // A real advance still reaches it
@@ -494,22 +460,24 @@ fn test_wait_observes_notification_during_check() {
     }
 }
 
-// Advances during condition checks cause rechecks until the deadline is reached.
+// An advance that reaches the deadline during a condition check ends the wait
+// without parking.
 #[test]
 fn test_wait_observes_advance_during_check() {
-    // Set a deadline that needs two advances from the ready callback
+    // Set a deadline that the ready callback will reach
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let waiter = clock.waiter();
     let deadline = clock.now() + Duration::from_secs(2);
 
-    // Each check advances one second, so the wait must notice both advances to end
+    // The check itself advances to the deadline, so the wait must end without a park
     let result = waiter.wait_until(Some(deadline), || {
-        tester.advance(Duration::from_secs(1));
+        tester.advance_to(deadline);
         None::<()>
     });
     assert_eq!(result, None);
     assert_eq!(clock.now(), deadline);
+    assert_eq!(waiter.signal.lock().parks, 0);
 }
 
 // A value arriving during a park wins over the deadline when an advance wakes the waiter.
@@ -591,4 +559,95 @@ fn test_waiter_registry_tracks_live_waiters() {
     drop(waiters);
     drop(signal);
     assert!(paused.state.lock().unwrap().signals.is_empty());
+}
+
+// Dropping a waiter removes its own registration and no other.
+#[test]
+fn test_dropping_a_waiter_keeps_other_registrations() {
+    // Order two waiters by key, so that removing the lowest key would show
+    let tester = TestClock::new();
+    let clock = tester.clock();
+    let mut waiters = [clock.waiter(), clock.waiter()];
+    waiters.sort_by_key(|waiter| waiter.signal.key());
+    let [survivor, dropped] = waiters;
+
+    // Dropping the higher key leaves exactly the survivor registered
+    drop(dropped);
+    let state = clock.paused.as_ref().unwrap().state.lock().unwrap();
+    assert_eq!(
+        state.signals.keys().copied().collect::<Vec<_>>(),
+        [survivor.signal.key()]
+    );
+}
+
+// Wall time follows the sum of the advances, without rounding each one.
+#[test]
+fn test_wall_time_accumulates_fractional_advances() {
+    // Pin wall time and advance twice by 150 ns, which Windows' 100 ns wall time cannot hold
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
+    tester.set_system_time(UNIX_EPOCH);
+    tester.advance(Duration::from_nanos(150));
+    tester.advance(Duration::from_nanos(150));
+    assert_eq!(clock.system_time(), UNIX_EPOCH + Duration::from_nanos(300));
+
+    // A wall jump starts the sum over from the new wall time
+    tester.set_system_time(UNIX_EPOCH + Duration::from_secs(1));
+    tester.advance(Duration::from_nanos(150));
+    tester.advance(Duration::from_nanos(150));
+    assert_eq!(
+        clock.system_time(),
+        UNIX_EPOCH + Duration::from_nanos(1_000_000_300)
+    );
+}
+
+// A driver stepping through next_deadline ends every sleep in deadline order.
+#[test]
+fn test_next_deadline_drives_sleeps_in_order() {
+    // Start three sleeps out of deadline order and keep their signals for inspection
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
+    let start = clock.now();
+    let mut sleeps: Vec<_> = [3, 1, 2]
+        .into_iter()
+        .map(|seconds| {
+            let clock = clock.clone();
+            let deadline = start + Duration::from_secs(seconds);
+            (deadline, thread::spawn(move || clock.sleep_until(deadline)))
+        })
+        .collect();
+    tester.wait_blocked(3);
+    sleeps.sort_by_key(|(deadline, _)| *deadline);
+    let signals = signals(&clock);
+
+    // Each advance wakes only the sleep it reaches, which returns before the next read
+    for (index, (deadline, sleep)) in sleeps.into_iter().enumerate() {
+        let next = tester.next_deadline().unwrap();
+        assert_eq!(next, deadline, "{index}");
+        tester.advance_to(next);
+        sleep.join().unwrap();
+        let woken: usize = signals.iter().map(|signal| wakes(signal)).sum();
+        assert_eq!(woken, index + 1, "{index}");
+    }
+    assert_eq!(tester.next_deadline(), None);
+    assert_eq!(blocked(&clock), 0);
+}
+
+// A real sleep lasts at least its duration, with no upper bound on how long.
+#[test]
+fn test_real_sleep_reaches_duration() {
+    let clock = Clock::real();
+    let start = Instant::now();
+    clock.sleep(Duration::from_millis(1));
+    assert!(clock.elapsed(start) >= Duration::from_millis(1));
+}
+
+// A real sleep_until returns only once its deadline has passed, with no upper
+// bound on how long.
+#[test]
+fn test_real_sleep_until_reaches_deadline() {
+    let clock = Clock::real();
+    let deadline = Instant::now() + Duration::from_millis(1);
+    clock.sleep_until(deadline);
+    assert!(Instant::now() >= deadline);
 }

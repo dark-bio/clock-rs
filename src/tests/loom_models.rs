@@ -171,7 +171,7 @@ fn test_wait_deadline_observes_notification_after_short_advance() {
         });
         tester.wait_blocked(1);
 
-        // Wake for a short advance before publishing and notifying the condition
+        // Advance short of the deadline before publishing and notifying the condition
         tester.advance(Duration::from_secs(1));
         *pair.0.lock().unwrap() = true;
         pair.1.notify_one();
@@ -236,7 +236,7 @@ fn test_wait_blocked_exposes_sleep_deadline() {
 #[test]
 fn test_condvar_drop_removes_registration_during_advance() {
     loom::model(|| {
-        // Create and drop a condvar while the driver may collect its signal
+        // Create and drop a condvar while the driver checks for reached deadlines
         let mut tester = TestClock::new();
         let clock = tester.clock();
         let creating = thread::spawn({
@@ -244,7 +244,7 @@ fn test_condvar_drop_removes_registration_during_advance() {
             move || drop(Condvar::new(&clock))
         });
 
-        // Even an advance retaining the signal cannot retain its registration
+        // An advance cannot leave a dropped condvar's registration behind
         tester.advance(Duration::from_secs(1));
         creating.join().unwrap();
         assert_idle(&tester, &clock);
