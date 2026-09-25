@@ -17,10 +17,10 @@ Reading a clock, sleeping on it and waiting on its condvars work in every build.
 
 ```toml
 [dependencies]
-darkbio-clock = "0.1"
+darkbio-clock = "0.2"
 
 [dev-dependencies]
-darkbio-clock = { version = "0.1", features = ["test-clock"] }
+darkbio-clock = { version = "0.2", features = ["test-clock"] }
 ```
 
 ```rust
