@@ -35,10 +35,13 @@ impl TestClock {
                     system_time: SystemTime::now(),
                     signals: BTreeMap::new(),
                     blocked: 0,
+                    deadlines: BTreeMap::new(),
                 }),
                 changed: Condvar::new(),
                 #[cfg(test)]
                 before_park: Mutex::new(None),
+                #[cfg(test)]
+                before_rewait: Mutex::new(None),
             }),
         }
     }
@@ -50,10 +53,11 @@ impl TestClock {
         }
     }
 
-    /// Moves both times forward by `by` and wakes every parked wait.
+    /// Moves both times forward by `by`, waking the sleeps and deadline waits
+    /// it reaches.
     ///
-    /// Returns once waits are notified, without waiting for them to act.
-    /// A zero advance does nothing.
+    /// Returns once they are notified, without waiting for them to act. A zero
+    /// advance does nothing.
     ///
     /// # Panics
     ///
@@ -65,9 +69,10 @@ impl TestClock {
         });
     }
 
-    /// Moves monotonic time to `target` and wall time by the same amount.
+    /// Moves monotonic time to `target` and wall time by the same amount,
+    /// waking the sleeps and deadline waits it reaches.
     ///
-    /// Wakes every parked wait and returns without waiting for them to act.
+    /// Returns once they are notified, without waiting for them to act.
     /// Advancing to the current time does nothing.
     ///
     /// # Panics
@@ -88,7 +93,8 @@ impl TestClock {
         self.paused.lock().system_time = time;
     }
 
-    /// Blocks until at least `count` threads are parked in this clock's sleeps.
+    /// Blocks until at least `count` threads are parked in this clock's sleeps
+    /// and condvar waits.
     ///
     /// A thread parked earlier counts too, so the count proves no progress on
     /// its own. Nothing bounds the wait, so the test runner ends a hang.
@@ -101,6 +107,16 @@ impl TestClock {
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+    }
+
+    /// Returns the earliest deadline among this clock's parked sleeps and
+    /// deadline waits, or `None` when none is parked.
+    ///
+    /// A wait is listed while parked. One woken by an advance stays listed
+    /// until its thread runs, so await an advance's effect before reading the
+    /// next deadline.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.paused.lock().deadlines.keys().next().copied()
     }
 
     /// Validates both new times before updating state and notifying waiters.
@@ -129,7 +145,7 @@ impl TestClock {
 
         // Wake outside the clock lock, since parking takes the signal lock first
         for signal in signals {
-            signal.notify_all();
+            signal.advance();
         }
     }
 }
@@ -164,13 +180,18 @@ impl fmt::Debug for TestClock {
 pub(crate) struct Paused {
     /// Time the clock started at, to show how far it has advanced.
     start: Instant,
-    /// Current times, live waiters and parked thread count.
+    /// Current times, live signals, parked thread count and deadlines.
     pub(crate) state: Mutex<PausedState>,
-    /// Wakes drivers when the parked thread count increases.
-    changed: Condvar,
-    /// One-shot test hook between a failed deadline check and its park.
+    /// Wakes drivers when the parked thread count changes.
+    pub(crate) changed: Condvar,
+    /// One-shot test hook, run before a park's first wait with no clock or
+    /// signal lock held.
     #[cfg(test)]
     pub(crate) before_park: Mutex<Option<BeforePark>>,
+    /// One-shot test hook, run like `before_park` before a park waits again
+    /// after a spurious wakeup.
+    #[cfg(test)]
+    pub(crate) before_rewait: Mutex<Option<BeforePark>>,
 }
 
 /// Mutable part of a test clock.
@@ -179,10 +200,12 @@ pub(crate) struct PausedState {
     now: Instant,
     /// Current wall time, independent of monotonic time when set explicitly.
     system_time: SystemTime,
-    /// Live waiters indexed by signal address, removed when each waiter drops.
+    /// Live waiters and condvars indexed by signal address, removed on drop.
     pub(crate) signals: BTreeMap<usize, Weak<Signal>>,
     /// Threads committed to parking while holding their signal's lock.
     pub(crate) blocked: usize,
+    /// Parked timed waits counted by deadline, each unlisted when its park ends.
+    deadlines: BTreeMap<Instant, usize>,
 }
 
 impl Paused {
@@ -213,20 +236,36 @@ impl Paused {
         self.lock().signals.remove(&(Arc::as_ptr(signal) as usize));
     }
 
-    /// Counts a park until its guard drops, while the caller holds its signal lock.
-    pub(crate) fn block(&self) -> Blocked<'_> {
-        self.lock().blocked += 1;
+    /// Counts a park, and lists its deadline, until the guard drops.
+    ///
+    /// The caller holds its signal lock until it parks, so an advance by a
+    /// driver that saw the count still wakes the park.
+    pub(crate) fn block(&self, deadline: Option<Instant>) -> Blocked<'_> {
+        // Count the park and list its deadline
+        let mut state = self.lock();
+        state.blocked += 1;
+        if let Some(deadline) = deadline {
+            *state.deadlines.entry(deadline).or_default() += 1;
+        }
+
+        // Wake drivers waiting for the count to grow
         self.changed.notify_all();
-        Blocked { paused: self }
+        Blocked {
+            paused: self,
+            deadline,
+        }
     }
 
-    /// Runs a test hook without holding any clock or signal lock.
+    /// Takes the one-shot test hook for a park's first wait, or for a wait
+    /// `again` after a spurious wakeup, for the caller to run with no lock held.
     #[cfg(test)]
-    pub(crate) fn check_park(&self, timer: Option<Instant>) {
-        let hook = self.before_park.lock().unwrap().take();
-        if let Some(hook) = hook {
-            hook(timer);
-        }
+    pub(crate) fn take_hook(&self, again: bool) -> Option<BeforePark> {
+        let hook = if again {
+            &self.before_rewait
+        } else {
+            &self.before_park
+        };
+        hook.lock().unwrap().take()
     }
 
     /// Locks the state, recovering it from poisoning, since no update under the
@@ -240,15 +279,32 @@ impl Paused {
 pub(crate) struct Blocked<'a> {
     /// Clock whose parked count includes this thread.
     paused: &'a Paused,
+    /// Deadline registered for this park, if it is timed.
+    deadline: Option<Instant>,
 }
 
 impl Drop for Blocked<'_> {
-    /// Removes this thread from the clock's parked count.
+    /// Removes this thread and its deadline from the clock's parked state.
     fn drop(&mut self) {
-        self.paused.lock().blocked -= 1;
+        // Uncount the park and unlist its deadline
+        let mut state = self.paused.lock();
+        state.blocked -= 1;
+        if let Some(deadline) = self.deadline {
+            let count = state
+                .deadlines
+                .get_mut(&deadline)
+                .expect("parked deadline exists");
+            *count -= 1;
+            if *count == 0 {
+                state.deadlines.remove(&deadline);
+            }
+        }
+
+        // Wake watchers of the count, such as tests waiting for it to drop
+        self.paused.changed.notify_all();
     }
 }
 
-/// Pauses a test sleep before parking and exposes its real timer, if any.
+/// Pauses a test wait before parking and exposes its real timer, if any.
 #[cfg(test)]
-type BeforePark = Box<dyn FnOnce(Option<Instant>) + Send>;
+pub(crate) type BeforePark = Box<dyn FnOnce(Option<Instant>) + Send>;
