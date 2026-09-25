@@ -18,6 +18,32 @@ impl Clock {
     /// a test clock, an advance to the deadline sends it, and the channel stays
     /// connected while the clock lives. A duration past the end of `Instant`'s
     /// range returns a receiver that never fires.
+    ///
+    /// Wait for a job or a timeout, driven from a test through `wait_timers`,
+    /// since `wait_blocked` cannot see a thread blocked in `select!`:
+    ///
+    /// ```
+    /// # #[cfg(feature = "test-clock")] {
+    /// use darkbio_clock::TestClock;
+    /// use darkbio_clock::crossbeam_channel::{select, unbounded};
+    /// use std::thread;
+    /// use std::time::Duration;
+    ///
+    /// let mut tester = TestClock::new();
+    /// let clock = tester.clock();
+    /// let (_jobs, queue) = unbounded::<u32>();
+    ///
+    /// let worker = thread::spawn(move || {
+    ///     select! {
+    ///         recv(queue) -> job => job.ok(),
+    ///         recv(clock.after(Duration::from_secs(5))) -> _ => None,
+    ///     }
+    /// });
+    /// tester.wait_timers(1);
+    /// tester.advance(Duration::from_secs(5));
+    /// assert_eq!(worker.join().unwrap(), None);
+    /// # }
+    /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "crossbeam")))]
     pub fn after(&self, duration: Duration) -> Receiver<Instant> {
         #[cfg(any(test, feature = "test-clock"))]

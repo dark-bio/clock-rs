@@ -8,6 +8,39 @@
 //!
 //! Both mirror std's. A condvar takes its clock when created and waits on this
 //! module's mutex, which otherwise works like std's.
+//!
+//! Wait for a condition until a deadline, checking it again after every return:
+//!
+//! ```
+//! # #[cfg(feature = "test-clock")] {
+//! use darkbio_clock::TestClock;
+//! use darkbio_clock::sync::{Condvar, Mutex};
+//! use std::thread;
+//! use std::time::Duration;
+//!
+//! let mut tester = TestClock::new();
+//! let clock = tester.clock();
+//! let (ready, condvar) = (Mutex::new(false), Condvar::new(&clock));
+//! let deadline = clock.now() + Duration::from_secs(5);
+//!
+//! thread::scope(|scope| {
+//!     let worker = scope.spawn(|| {
+//!         let mut guard = ready.lock().unwrap();
+//!         while !*guard {
+//!             let (next, result) = condvar.wait_deadline(guard, deadline).unwrap();
+//!             guard = next;
+//!             if result.timed_out() {
+//!                 return false;
+//!             }
+//!         }
+//!         true
+//!     });
+//!     tester.wait_blocked(1);
+//!     tester.advance(Duration::from_secs(5));
+//!     assert!(!worker.join().unwrap());
+//! });
+//! # }
+//! ```
 
 use crate::{Clock, Waiter, primitives};
 use std::fmt;
