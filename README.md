@@ -5,7 +5,7 @@
 [![](https://github.com/dark-bio/clock-rs/workflows/tests/badge.svg)](https://github.com/dark-bio/clock-rs/actions/workflows/ci.yml)
 [![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](https://github.com/dark-bio/clock-rs/blob/main/LICENSE)
 
-This crate provides a clock that tests can stop and advance, with blocking sleeps, condition variables and crossbeam timers that follow it. Code reads monotonic time, wall time and elapsed durations through a `Clock` handle instead of std's free functions. Production passes `Clock::real()`, and tests pass a clock from a `TestClock`, which moves only when the test advances it.
+This crate provides a clock that tests can stop and advance, with blocking sleeps, condition variables and crossbeam timers that follow it. Code reads monotonic time, wall time and elapsed durations through a `Clock` handle instead of std's time calls. Production passes `Clock::real()`, and tests pass a clock from a `TestClock`, which moves only when the test advances it.
 
 Sleeps, condvar waits and timers work on ordinary threads, with no async runtime involved. Advancing a test clock wakes and fires them, so a test runs a 5 s timeout without waiting 5 s.
 
@@ -13,14 +13,14 @@ Clocks are explicit handles, never globals or thread-locals. Parallel tests each
 
 ## Quick start
 
-Reading a clock, sleeping on it and waiting on its condvars work in every build. Timers need the `crossbeam` feature, and `TestClock` needs `test-clock`, without which `Clock` is zero-sized and always real. Enable `test-clock` only on a dev-dependency, since Cargo unifies features across a build. Pick the same version as the regular dependency, so the feature reaches the copy the code uses.
+Reading a clock, sleeping on it and waiting on its condvars work in every build. Timers need the `crossbeam` feature, and `TestClock` needs `test-clock`, without which `Clock` is zero-sized and always real. Enable `test-clock` only on a dev-dependency, which Cargo's resolver 2 or later, the default from the 2021 edition on, keeps out of normal builds. Pick the same version as the regular dependency, so the feature reaches the copy the code uses.
 
 ```toml
 [dependencies]
-darkbio-clock = "0.2"
+darkbio-clock = "0.3"
 
 [dev-dependencies]
-darkbio-clock = { version = "0.2", features = ["test-clock"] }
+darkbio-clock = { version = "0.3", features = ["test-clock"] }
 ```
 
 ```rust
@@ -51,7 +51,7 @@ Each call mirrors the std or crossbeam call it replaces. The clock is the receiv
 | `start.elapsed()` | `clock.elapsed(start)` |
 | `SystemTime::now()` | `clock.system_time()` |
 | `thread::sleep(duration)` | `clock.sleep(duration)` |
-| `thread::sleep_until(deadline)` | `clock.sleep_until(deadline)` |
+| `thread::sleep_until(deadline)`, unstable in std | `clock.sleep_until(deadline)` |
 | `Condvar::new()` | `Condvar::new(&clock)` |
 | `condvar.wait_timeout(guard, deadline - now)` | `condvar.wait_deadline(guard, deadline)` |
 | `crossbeam_channel::after(d)` | `clock.after(d)` |
@@ -64,6 +64,8 @@ Each call mirrors the std or crossbeam call it replaces. The clock is the receiv
 ## Locks
 
 A condvar waits on this crate's `Mutex`, because relocking after a wait needs the mutex, and a std guard does not give it back. The mutex wraps std's and keeps its behavior, with one exception. A wait that starts while its thread unwinds from a panic, on a guard taken before the panic, poisons the mutex. Only a mutex that a clock's condvar waits on needs to change, and every other lock can stay std's.
+
+rustc's `let_underscore_lock` lint knows only std's guards, so it misses `let _ = mutex.lock()` on this crate's mutex, which unlocks at once. The allow-by-default `let_underscore_drop` lint catches it.
 
 `wait_deadline` returns once notified or once the condvar's clock reaches the deadline. As with std's, its `timed_out()` reports a timeout only if the deadline ended the wait before it saw a notification, however late the mutex is relocked. A wait may also return spuriously, including when a notification meant for another waiter ends it. So callers recheck their condition after every return, timeout or not, and a deadline worker picks its earliest deadline again.
 
@@ -85,9 +87,9 @@ A test clock's timers stay connected until the `TestClock` and every `Clock` han
 
 ### Moving time
 
-A test clock starts at the real monotonic and wall times. `advance` and `advance_to` move both together, and `set_system_time` jumps wall time alone, forwards or backwards, the way an NTP correction does. Only the `TestClock` moves time, and its controls take `&mut self`, so each clock has one driver. A `Clock` handle reads, sleeps and creates condvars and timers, but cannot advance.
+A test clock starts at the real monotonic and wall times, so until a test moves it, a stray `Instant::now()` or `SystemTime::now()` reads nearly the same time. A test meant to catch such reads advances first and pins wall time with `set_system_time`. `advance` and `advance_to` move both together, and `set_system_time` jumps wall time alone, forwards or backwards, the way an NTP correction does. Only the `TestClock` moves time, and its controls take `&mut self`, so each clock has one driver. A `Clock` handle reads, sleeps and creates condvars and timers, but cannot advance.
 
-An advance jumps straight to its target. Where every period matters, advance one period and wait for its effect before the next. A test clock never moves by itself, so a deadline nobody advances to never passes, and such tests belong under a runner that stops hung tests.
+An advance jumps straight to its target. Where every period matters, advance one period and wait for its effect before the next. A test clock never moves by itself, so a deadline nobody advances to never passes, and the test hangs. `cargo test` never stops a hung test, so run tests under a runner that does, such as cargo-nextest with `slow-timeout = { period = "60s", terminate-after = 2 }`.
 
 Dropping the `TestClock` stops all advances. Its parked sleeps then never end, its condvar waits end only when notified, and its unfired timers never fire while a `Clock` handle lives. Once the last handle is gone too, those timers disconnect, and a `select!` on one sees that arm ready with an error. So advance past their deadlines before dropping the `TestClock`.
 

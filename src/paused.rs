@@ -457,9 +457,10 @@ impl Paused {
         self.lock().system_time()
     }
 
-    /// Returns how far the clock has advanced since its creation.
-    pub(crate) fn advanced(&self) -> Duration {
-        self.lock().now - self.start
+    /// Reads the advance and wall time together for formatting.
+    pub(crate) fn snapshot(&self) -> (Duration, SystemTime) {
+        let state = self.lock();
+        (state.now - self.start, state.system_time())
     }
 
     /// Registers a waiter's signal before its first notification check.

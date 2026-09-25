@@ -1,6 +1,6 @@
 [package]
 name = "darkbio-clock"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Péter Szilágyi <peter@dark.bio>"]
 description = "Virtual clock for testing blocking code"
 repository = "https://github.com/dark-bio/clock-rs"

@@ -106,6 +106,45 @@ fn test_debug_writer_can_read_clock() {
     assert!(writer.output.contains("timers: 1"));
 }
 
+// A clock's Debug shows both times from one moment, even when its writer
+// advances the clock.
+#[test]
+fn test_clock_debug_uses_one_snapshot() {
+    /// Advances the clock while collecting its formatted output.
+    struct AdvancingWriter {
+        /// Owner of the clock being formatted.
+        tester: TestClock,
+        /// Text written by the formatter.
+        output: String,
+    }
+
+    impl fmt::Write for AdvancingWriter {
+        /// Advances the clock before appending each piece of output.
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.tester.advance(Duration::from_secs(1));
+            self.output.push_str(text);
+            Ok(())
+        }
+    }
+
+    // Set a known wall time and keep a handle while the writer owns the driver
+    let mut tester = TestClock::new();
+    tester.set_system_time(UNIX_EPOCH);
+    let clock = tester.clock();
+    let mut writer = AdvancingWriter {
+        tester,
+        output: String::new(),
+    };
+
+    // Each write advances the clock, but both displayed times precede those writes
+    fmt::write(&mut writer, format_args!("{clock:?}")).unwrap();
+    assert_eq!(
+        writer.output,
+        format!("Clock {{ paused: true, advanced: 0ns, system_time: {UNIX_EPOCH:?} }}")
+    );
+    assert!(clock.system_time() > UNIX_EPOCH);
+}
+
 // Elapsed time follows advances and saturates at zero for future instants.
 #[test]
 fn test_elapsed_saturates() {
