@@ -14,7 +14,7 @@ check:
 # loom explores the wait core with at most four preemptions per execution, using
 # a separate release cache so it leaves ordinary builds alone.
 loom:
-	RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=4 CARGO_TARGET_DIR=target/loom cargo test --release --lib --locked loom_tests
+	RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=4 CARGO_TARGET_DIR=target/loom cargo test --release --lib --locked loom_models
 
 # lint checks the recommended clippy configuration in lint/clippy.toml against
 # real calls, and that the README carries it verbatim.

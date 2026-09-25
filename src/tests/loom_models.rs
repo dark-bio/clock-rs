@@ -17,9 +17,9 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 /// Checks that completed waits leave no parks, deadlines or registrations.
-fn assert_idle(test: &TestClock, clock: &Clock) {
+fn assert_idle(tester: &TestClock, clock: &Clock) {
     // Read the public deadline before inspecting the remaining bookkeeping
-    assert_eq!(test.next_deadline(), None);
+    assert_eq!(tester.next_deadline(), None);
     let state = clock.paused.as_ref().unwrap().state.lock().unwrap();
     assert_eq!(state.blocked, 0);
     assert!(state.signals.is_empty());
@@ -29,8 +29,8 @@ fn assert_idle(test: &TestClock, clock: &Clock) {
 fn notification_model(holding: bool) {
     loom::model(move || {
         // Race a condition wait with a notifier using the same modeled mutex
-        let test = TestClock::new();
-        let clock = test.clock();
+        let tester = TestClock::new();
+        let clock = tester.clock();
         let pair = Arc::new((Mutex::new(false), Condvar::new(&clock)));
         let waiting = thread::spawn({
             let pair = pair.clone();
@@ -54,7 +54,7 @@ fn notification_model(holding: bool) {
         // Both schedules finish and release the condvar's registration
         waiting.join().unwrap();
         drop(pair);
-        assert_idle(&test, &clock);
+        assert_idle(&tester, &clock);
     });
 }
 
@@ -74,8 +74,8 @@ fn test_wait_observes_notification_after_unlock() {
 fn two_waiters_model(broadcast: bool) {
     loom::model(move || {
         // Park two waiters on one condvar before any notification can arrive
-        let test = TestClock::new();
-        let clock = test.clock();
+        let tester = TestClock::new();
+        let clock = tester.clock();
         let pair = Arc::new((Mutex::new(false), Condvar::new(&clock)));
         let waiters: Vec<_> = (0..2)
             .map(|_| {
@@ -86,7 +86,7 @@ fn two_waiters_model(broadcast: bool) {
                 })
             })
             .collect();
-        test.wait_blocked(2);
+        tester.wait_blocked(2);
 
         // Publish one condition and wake both waiters through the selected operation
         *pair.0.lock().unwrap() = true;
@@ -102,7 +102,7 @@ fn two_waiters_model(broadcast: bool) {
             waiter.join().unwrap();
         }
         drop(pair);
-        assert_idle(&test, &clock);
+        assert_idle(&tester, &clock);
     });
 }
 
@@ -123,9 +123,9 @@ fn test_notify_all_releases_two_waiters() {
 fn test_wait_deadline_observes_exact_advance() {
     loom::model(|| {
         // Start a deadline wait without arranging which thread reaches it first
-        let mut test = TestClock::new();
-        test.set_system_time(UNIX_EPOCH);
-        let clock = test.clock();
+        let mut tester = TestClock::new();
+        tester.set_system_time(UNIX_EPOCH);
+        let clock = tester.clock();
         let deadline = clock.now() + Duration::from_secs(1);
         let waiting = thread::spawn({
             let clock = clock.clone();
@@ -142,9 +142,9 @@ fn test_wait_deadline_observes_exact_advance() {
         });
 
         // Reaching the deadline must suffice even when it precedes the park
-        test.advance_to(deadline);
+        tester.advance_to(deadline);
         waiting.join().unwrap();
-        assert_idle(&test, &clock);
+        assert_idle(&tester, &clock);
     });
 }
 
@@ -153,8 +153,8 @@ fn test_wait_deadline_observes_exact_advance() {
 fn test_wait_deadline_observes_notification_after_short_advance() {
     loom::model(|| {
         // Park a timed wait whose condition the driver has not set
-        let mut test = TestClock::new();
-        let clock = test.clock();
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
         let start = clock.now();
         let deadline = start + Duration::from_secs(2);
         let pair = Arc::new((Mutex::new(false), Condvar::new(&clock)));
@@ -169,10 +169,10 @@ fn test_wait_deadline_observes_notification_after_short_advance() {
                 assert!(*ready);
             }
         });
-        test.wait_blocked(1);
+        tester.wait_blocked(1);
 
         // Wake for a short advance before publishing and notifying the condition
-        test.advance(Duration::from_secs(1));
+        tester.advance(Duration::from_secs(1));
         *pair.0.lock().unwrap() = true;
         pair.1.notify_one();
 
@@ -180,7 +180,7 @@ fn test_wait_deadline_observes_notification_after_short_advance() {
         waiting.join().unwrap();
         assert_eq!(clock.now(), start + Duration::from_secs(1));
         drop(pair);
-        assert_idle(&test, &clock);
+        assert_idle(&tester, &clock);
     });
 }
 
@@ -189,8 +189,8 @@ fn test_wait_deadline_observes_notification_after_short_advance() {
 fn test_sleep_until_observes_exact_advance() {
     loom::model(|| {
         // Start a sleeper without ordering its checks against the advance
-        let mut test = TestClock::new();
-        let clock = test.clock();
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
         let deadline = clock.now() + Duration::from_secs(1);
         let sleeper = thread::spawn({
             let clock = clock.clone();
@@ -201,9 +201,9 @@ fn test_sleep_until_observes_exact_advance() {
         });
 
         // The deadline advance alone must finish the sleep and remove its waiter
-        test.advance_to(deadline);
+        tester.advance_to(deadline);
         sleeper.join().unwrap();
-        assert_idle(&test, &clock);
+        assert_idle(&tester, &clock);
     });
 }
 
@@ -212,8 +212,8 @@ fn test_sleep_until_observes_exact_advance() {
 fn test_wait_blocked_exposes_sleep_deadline() {
     loom::model(|| {
         // Race the driver's blocked-count wait against the sleeper's registration
-        let mut test = TestClock::new();
-        let clock = test.clock();
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
         let deadline = clock.now() + Duration::from_secs(1);
         let sleeper = thread::spawn({
             let clock = clock.clone();
@@ -224,11 +224,11 @@ fn test_wait_blocked_exposes_sleep_deadline() {
         });
 
         // Observing a park guarantees its deadline is visible and its wakeup reaches it
-        test.wait_blocked(1);
-        assert_eq!(test.next_deadline(), Some(deadline));
-        test.advance_to(deadline);
+        tester.wait_blocked(1);
+        assert_eq!(tester.next_deadline(), Some(deadline));
+        tester.advance_to(deadline);
         sleeper.join().unwrap();
-        assert_idle(&test, &clock);
+        assert_idle(&tester, &clock);
     });
 }
 
@@ -237,17 +237,17 @@ fn test_wait_blocked_exposes_sleep_deadline() {
 fn test_condvar_drop_removes_registration_during_advance() {
     loom::model(|| {
         // Create and drop a condvar while the driver may collect its signal
-        let mut test = TestClock::new();
-        let clock = test.clock();
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
         let creating = thread::spawn({
             let clock = clock.clone();
             move || drop(Condvar::new(&clock))
         });
 
         // Even an advance retaining the signal cannot retain its registration
-        test.advance(Duration::from_secs(1));
+        tester.advance(Duration::from_secs(1));
         creating.join().unwrap();
-        assert_idle(&test, &clock);
+        assert_idle(&tester, &clock);
     });
 }
 
@@ -256,8 +256,8 @@ fn test_condvar_drop_removes_registration_during_advance() {
 fn test_notify_all_races_advance_with_mixed_waiters() {
     loom::model(|| {
         // Park two waiters on separate conditions, so the untimed one can notify
-        let mut test = TestClock::new();
-        let clock = test.clock();
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
         let deadline = clock.now() + Duration::from_secs(1);
         let pair = Arc::new((Mutex::new((false, false)), Condvar::new(&clock)));
         let timed = thread::spawn({
@@ -294,17 +294,17 @@ fn test_notify_all_races_advance_with_mixed_waiters() {
                 pair.1.notify_all();
             }
         });
-        test.wait_blocked(2);
+        tester.wait_blocked(2);
 
         // Release the untimed notifier and race its broadcast against the advance
         pair.0.lock().unwrap().0 = true;
         pair.1.notify_all();
-        test.advance_to(deadline);
+        tester.advance_to(deadline);
 
         // Both waiters finish and leave no counts or registrations behind
         timed.join().unwrap();
         untimed.join().unwrap();
         drop(pair);
-        assert_idle(&test, &clock);
+        assert_idle(&tester, &clock);
     });
 }

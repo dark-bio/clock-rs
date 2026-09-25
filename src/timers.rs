@@ -18,6 +18,32 @@ impl Clock {
     /// a test clock, an advance to the deadline sends it, and the channel stays
     /// connected while the clock lives. A duration past the end of `Instant`'s
     /// range returns a receiver that never fires.
+    ///
+    /// Wait for a job or a timeout, driven from a test through `wait_timers`,
+    /// since `wait_blocked` cannot see a thread blocked in `select!`:
+    ///
+    /// ```
+    /// # #[cfg(feature = "test-clock")] {
+    /// use darkbio_clock::TestClock;
+    /// use darkbio_clock::crossbeam_channel::{select, unbounded};
+    /// use std::thread;
+    /// use std::time::Duration;
+    ///
+    /// let mut tester = TestClock::new();
+    /// let clock = tester.clock();
+    /// let (_jobs, queue) = unbounded::<u32>();
+    ///
+    /// let worker = thread::spawn(move || {
+    ///     select! {
+    ///         recv(queue) -> job => job.ok(),
+    ///         recv(clock.after(Duration::from_secs(5))) -> _ => None,
+    ///     }
+    /// });
+    /// tester.wait_timers(1);
+    /// tester.advance(Duration::from_secs(5));
+    /// assert_eq!(worker.join().unwrap(), None);
+    /// # }
+    /// ```
     #[cfg_attr(docsrs, doc(cfg(feature = "crossbeam")))]
     pub fn after(&self, duration: Duration) -> Receiver<Instant> {
         #[cfg(any(test, feature = "test-clock"))]
@@ -86,100 +112,9 @@ impl Clock {
     }
 }
 
-/// Checks the real clock's timers and receives against crossbeam's, without waiting.
+// The tests live in src/tests, loaded from here so that they keep this
+// module's private items in reach
 #[cfg(all(test, not(loom)))]
 #[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use super::*;
-    use crossbeam_channel::{TryRecvError, bounded};
-
-    // Real timers keep crossbeam's immediate delivery, capacity and connection semantics.
-    #[test]
-    fn test_real_timers_match_crossbeam_immediate_delivery() {
-        // Use a reached instant so neither implementation waits on real time
-        let clock = Clock::real();
-        let deadline = clock.now();
-        for (name, timer) in [
-            ("clock", clock.at(deadline)),
-            ("crossbeam", crossbeam_channel::at(deadline)),
-        ] {
-            assert_eq!(timer.capacity(), Some(1), "{name}");
-            assert_eq!(timer.try_recv(), Ok(deadline), "{name}");
-            assert_eq!(timer.try_recv(), Err(TryRecvError::Empty), "{name}");
-        }
-
-        // Zero-duration timers deliver an instant bounded by the surrounding reads
-        let before = clock.now();
-        let timers = [
-            clock.after(Duration::ZERO),
-            crossbeam_channel::after(Duration::ZERO),
-        ];
-        let after = clock.now();
-        for (index, timer) in timers.into_iter().enumerate() {
-            assert!(
-                (before..=after).contains(&timer.try_recv().unwrap()),
-                "{index}"
-            );
-            assert_eq!(timer.try_recv(), Err(TryRecvError::Empty), "{index}");
-        }
-
-        // Overflow keeps the never receiver's zero capacity and empty connection
-        for (name, timer) in [
-            ("clock", clock.after(Duration::MAX)),
-            ("crossbeam", crossbeam_channel::after(Duration::MAX)),
-        ] {
-            assert_eq!(timer.capacity(), Some(0), "{name}");
-            assert_eq!(timer.try_recv(), Err(TryRecvError::Empty), "{name}");
-        }
-    }
-
-    // Real-clock receives keep crossbeam's precedence of messages and disconnections.
-    #[test]
-    fn test_real_receive_adapters_match_crossbeam_precedence() {
-        for relative in [false, true] {
-            // Feed identical messages to the adapter and to crossbeam directly
-            let clock = Clock::real();
-            let deadline = clock.now();
-            let (sender, receiver) = bounded(1);
-            let (reference_sender, reference) = bounded(1);
-            let receive = || {
-                if relative {
-                    clock.recv_timeout(&receiver, Duration::ZERO)
-                } else {
-                    clock.recv_deadline(&receiver, deadline)
-                }
-            };
-            let direct = || {
-                if relative {
-                    reference.recv_timeout(Duration::ZERO)
-                } else {
-                    reference.recv_deadline(deadline)
-                }
-            };
-            sender.send(7).unwrap();
-            reference_sender.send(7).unwrap();
-            assert_eq!(receive(), direct(), "{relative}");
-
-            // Empty connected channels expire immediately at the reached deadline
-            assert_eq!(receive(), direct(), "{relative}");
-            assert_eq!(receive(), Err(RecvTimeoutError::Timeout), "{relative}");
-
-            // Disconnection takes precedence over the same deadline
-            drop(sender);
-            drop(reference_sender);
-            assert_eq!(receive(), direct(), "{relative}");
-            assert_eq!(receive(), Err(RecvTimeoutError::Disconnected), "{relative}");
-        }
-
-        // Overflow receives a buffered message and then reports disconnection
-        let clock = Clock::real();
-        let (sender, receiver) = bounded(1);
-        sender.send(7).unwrap();
-        drop(sender);
-        assert_eq!(clock.recv_timeout(&receiver, Duration::MAX), Ok(7));
-        assert_eq!(
-            clock.recv_timeout(&receiver, Duration::MAX),
-            Err(RecvTimeoutError::Disconnected)
-        );
-    }
-}
+#[path = "tests/timers.rs"]
+mod tests;
