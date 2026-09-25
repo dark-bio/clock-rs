@@ -7,7 +7,7 @@
 //! Checks timer delivery, retention and receive precedence without real deadlines.
 
 use super::*;
-use crate::tests::helpers::{blocked, pause_before_park};
+use crate::tests::helpers::{blocked, signals, wakes};
 use crossbeam_channel::{bounded, select};
 use std::thread;
 use std::time::UNIX_EPOCH;
@@ -296,16 +296,11 @@ fn test_next_deadline_combines_timers_and_parked_waits() {
     tester.wait_timers(2);
     assert_eq!(tester.next_deadline(), Some(start + Duration::from_secs(1)));
 
-    // Hold the sleep between parks to observe the remaining timer on its own
-    let (checked, resume) = pause_before_park(&clock);
+    // Firing the first timer wakes nothing else, leaving the sleep counted and listed
     tester.advance(Duration::from_secs(1));
     assert_eq!(first.try_recv(), Ok(start + Duration::from_secs(1)));
-    assert_eq!(checked.recv().unwrap(), None);
-    assert_eq!(tester.next_deadline(), Some(start + Duration::from_secs(3)));
-
-    // Parking again puts the sleep ahead of the remaining timer
-    resume.send(()).unwrap();
-    tester.wait_blocked(1);
+    assert_eq!(wakes(&signals(&clock)[0]), 0);
+    assert_eq!(blocked(&clock), 1);
     assert_eq!(tester.next_deadline(), Some(start + Duration::from_secs(2)));
 
     // Ending the sleep exposes the final timer, whose firing empties the deadlines

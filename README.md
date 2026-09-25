@@ -63,9 +63,9 @@ Each call mirrors the std or crossbeam call it replaces. The clock is the receiv
 
 ## Locks
 
-A condvar waits on this crate's `Mutex`, because relocking after a wait needs the mutex, and a std guard does not give it back. The mutex wraps std's and keeps its behavior. Only a mutex that a clock's condvar waits on needs to change, and every other lock can stay std's.
+A condvar waits on this crate's `Mutex`, because relocking after a wait needs the mutex, and a std guard does not give it back. The mutex wraps std's and keeps its behavior, with one exception. A wait that starts while its thread unwinds from a panic, on a guard taken before the panic, poisons the mutex. Only a mutex that a clock's condvar waits on needs to change, and every other lock can stay std's.
 
-`wait_deadline` returns once notified or once the condvar's clock reaches the deadline. Its `timed_out()` reports whether the clock had reached the deadline once the mutex was relocked. Like std's waits, it may also return spuriously, so callers recheck their condition, or recompute their deadline, after every return.
+`wait_deadline` returns once notified or once the condvar's clock reaches the deadline. As with std's, its `timed_out()` reports a timeout only if the deadline ended the wait before it saw a notification, however late the mutex is relocked. A wait may also return spuriously, including when a notification meant for another waiter ends it. So callers recheck their condition after every return, timeout or not, and a deadline worker picks its earliest deadline again.
 
 There is no `wait_timeout`. A relative timeout computed as `deadline - now` overshoots when an advance lands between the subtraction and the wait, and on a test clock that overshoot is a hang. A condvar has no `Default` either, since its clock is always explicit.
 
@@ -91,11 +91,13 @@ Dropping the `TestClock` stops all advances. Its parked sleeps then never end, i
 
 ### Waiting for threads
 
-An advance returns once the sleeps and deadline waits it reaches are notified and its due timers hold their messages, not once any thread has acted. Wait for the effect itself, such as a result or a message, before checking it.
+An advance returns once the sleeps and deadline waits it reaches are woken and its due timers hold their messages, not once any thread has acted. Wait for the effect itself, such as a result or a message, before checking it.
+
+An advance wakes only the waits whose deadlines it reaches, and never counts as a notification. Reaching a wait on a condvar wakes the condvar's other waits too, so one that saw an earlier notification returns then, as a spurious wakeup.
 
 `wait_blocked(n)` returns once at least `n` threads are parked in the clock's sleeps and condvar waits, timed or not. Threads blocked in a crossbeam receive or `select!` are invisible to it, so with `crossbeam`, `wait_timers(n)` waits for at least `n` armed timers instead, counting those of waiting receives. An earlier park or timer counts too, so neither count proves progress on its own.
 
-`next_deadline()` returns the earliest deadline among the clock's parked sleeps, deadline waits and unfired timers, and advancing to it runs a test to its next timeout. A woken wait stays listed until its thread runs, so await an advance's effect before reading the next deadline.
+`next_deadline()` returns the earliest deadline among the clock's parked sleeps, deadline waits and unfired timers, and advancing to it runs a test to its next timeout. A wait stays listed until it stops waiting, so await an advance's effect before reading the next deadline.
 
 ### Deadlines
 
