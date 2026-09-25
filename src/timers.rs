@@ -15,9 +15,9 @@ impl Clock {
     /// clock reaches it.
     ///
     /// It mirrors `crossbeam_channel::after`, which it is on the real clock. On
-    /// a test clock, an advance to the deadline sends it, and the channel stays
-    /// connected while the clock lives. A duration past the end of `Instant`'s
-    /// range returns a receiver that never fires.
+    /// a test clock, it is [`Self::at`] for the instant `duration` from now. A
+    /// duration past the end of `Instant`'s range returns a receiver that never
+    /// fires.
     ///
     /// Wait for a job or a timeout, driven from a test through `wait_timers`,
     /// since `wait_blocked` cannot see a thread blocked in `select!`:
@@ -60,8 +60,13 @@ impl Clock {
     /// once if it already has.
     ///
     /// It mirrors `crossbeam_channel::at`, which it is on the real clock. On a
-    /// test clock, an advance to the deadline sends it, even one that overshoots,
-    /// and the channel stays connected while the clock lives.
+    /// test clock, an advance that reaches the deadline delivers it, even one
+    /// that overshoots, before any thread can read the new time. The channel
+    /// stays connected until the `TestClock` and every `Clock` handle are gone.
+    ///
+    /// An advance sends its due timers one at a time, and a waiting `select!`
+    /// takes the first one sent. So a `select_biased!` over timers due at the
+    /// same instant can take a later arm than it would on the real clock.
     #[cfg_attr(docsrs, doc(cfg(feature = "crossbeam")))]
     pub fn at(&self, deadline: Instant) -> Receiver<Instant> {
         #[cfg(any(test, feature = "test-clock"))]
@@ -74,8 +79,10 @@ impl Clock {
     /// Receives a message, waiting up to `timeout` on this clock.
     ///
     /// It mirrors crossbeam's `Receiver::recv_timeout`, which it is on the real
-    /// clock. A buffered message or a disconnection wins over the timeout. A
-    /// timeout past the end of `Instant`'s range waits like `Receiver::recv`.
+    /// clock. A buffered message or a disconnection wins over the timeout. On a
+    /// test clock, it is [`Self::recv_deadline`] for the instant `timeout` from
+    /// now. A timeout past the end of `Instant`'s range waits like
+    /// `Receiver::recv`.
     #[cfg_attr(docsrs, doc(cfg(feature = "crossbeam")))]
     pub fn recv_timeout<T>(
         &self,
@@ -96,8 +103,9 @@ impl Clock {
     ///
     /// It mirrors crossbeam's `Receiver::recv_deadline`, which it is on the real
     /// clock. A buffered message or a disconnection wins over the deadline. On a
-    /// test clock, a waiting receive arms a timer, which `wait_timers` counts
-    /// until it fires or the receive returns.
+    /// test clock, a clock timer due by the deadline holds its message before
+    /// the receive can time out, so it wins too. A waiting receive arms a timer,
+    /// which `wait_timers` counts until it fires or the receive returns.
     #[cfg_attr(docsrs, doc(cfg(feature = "crossbeam")))]
     pub fn recv_deadline<T>(
         &self,
