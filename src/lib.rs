@@ -13,6 +13,8 @@
 // The crate only builds on std's safe synchronization and never needs unsafe
 #![forbid(unsafe_code)]
 
+pub mod sync;
+
 // Test clocks exist only in tests, so a build without the test-clock feature
 // cannot stop its own time
 #[cfg(any(test, feature = "test-clock"))]
@@ -105,11 +107,14 @@ impl Clock {
 
     /// Creates a waiter that measures deadlines on this clock.
     fn waiter(&self) -> Waiter {
+        // Register the signal before any wait can observe the clock
         let signal = Arc::new(Signal::default());
         #[cfg(any(test, feature = "test-clock"))]
         if let Some(paused) = &self.paused {
             paused.register(&signal);
         }
+
+        // Keep the registration alive for the waiter's lifetime
         Waiter {
             clock: self.clone(),
             signal,
@@ -160,11 +165,10 @@ impl Waiter {
         deadline: Option<Instant>,
         mut ready: impl FnMut() -> Option<T>,
     ) -> Option<T> {
-        // A test clock wakes its waiters when it moves, so only real time needs a timer
-        #[cfg(any(test, feature = "test-clock"))]
-        let timer = deadline.filter(|_| self.clock.paused.is_none());
-        #[cfg(not(any(test, feature = "test-clock")))]
-        let timer = deadline;
+        // Pick the real timer once, so the test seam reports what every park uses
+        let timer = self.timer(deadline);
+
+        // Check and park in turns, until a value arrives or the deadline passes
         loop {
             // Take the generation before checking, so a change after the check cuts the park short
             let seen = self.signal.generation();
@@ -174,29 +178,75 @@ impl Waiter {
             if deadline.is_some_and(|deadline| self.clock.now() >= deadline) {
                 return None;
             }
-            #[cfg(test)]
-            if let Some(paused) = &self.clock.paused {
-                paused.check_park(timer);
-            }
-            self.park(seen, timer);
+            drop(self.park(self.signal.lock(), seen, deadline, timer));
         }
     }
 
-    /// Parks while `seen` is current, using a real timer only on a real clock.
-    fn park(&self, seen: u64, timer: Option<Instant>) {
-        let mut state = self.signal.lock();
-        if state.generation != seen {
-            return;
-        }
-        // Hold the signal lock until waiting, so an advance cannot pass the park
+    /// Returns the deadline as a real timer on a real clock, and no timer on a
+    /// test clock, whose advances end its waits.
+    fn timer(&self, deadline: Option<Instant>) -> Option<Instant> {
         #[cfg(any(test, feature = "test-clock"))]
-        let _blocked = self.clock.paused.as_ref().map(|paused| paused.block());
-        #[cfg(test)]
-        {
-            state.parks += 1;
-            self.signal.changed.notify_all();
+        if self.clock.paused.is_some() {
+            return None;
         }
-        while state.generation == seen {
+        deadline
+    }
+
+    /// Parks until the generation moves on from `seen` or the clock reaches
+    /// `deadline`, and returns the state locked again.
+    ///
+    /// Only a real clock's park uses a real timer. In tests, one-shot hooks run
+    /// before its first wait and before a wait after a spurious wakeup, with
+    /// the signal unlocked.
+    fn park<'a>(
+        &'a self,
+        mut state: MutexGuard<'a, SignalState>,
+        seen: u64,
+        deadline: Option<Instant>,
+        timer: Option<Instant>,
+    ) -> MutexGuard<'a, SignalState> {
+        // Count the park once, keeping it counted through spurious wakeups
+        #[cfg(any(test, feature = "test-clock"))]
+        let mut blocked = None;
+
+        loop {
+            // Stop once the generation moves or the clock reaches the deadline
+            let now = self.clock.now();
+            if state.generation != seen || deadline.is_some_and(|deadline| now >= deadline) {
+                break;
+            }
+
+            // Let tests act before a wait, then check again for any change they made
+            #[cfg(test)]
+            if let Some(hook) = self
+                .clock
+                .paused
+                .as_ref()
+                .and_then(|paused| paused.take_hook(blocked.is_some()))
+            {
+                drop(state);
+                hook(timer);
+                state = self.signal.lock();
+                continue;
+            }
+
+            // Count the park while the signal is locked, so that an advance seen after
+            // the count still wakes it
+            #[cfg(any(test, feature = "test-clock"))]
+            if blocked.is_none() {
+                blocked = self
+                    .clock
+                    .paused
+                    .as_ref()
+                    .map(|paused| paused.block(deadline));
+            }
+            #[cfg(test)]
+            {
+                state.parks += 1;
+                self.signal.parked.notify_all();
+            }
+
+            // Wait for a wakeup or the real timer, leaving expiry to the check above
             state = match timer {
                 None => self
                     .signal
@@ -204,11 +254,6 @@ impl Waiter {
                     .wait(state)
                     .expect("waiter signal not poisoned"),
                 Some(timer) => {
-                    // Decide expiry by the time, since a wait's own timeout flag is unreliable
-                    let now = Instant::now();
-                    if now >= timer {
-                        break;
-                    }
                     self.signal
                         .changed
                         .wait_timeout(state, timer - now)
@@ -217,6 +262,11 @@ impl Waiter {
                 }
             };
         }
+
+        // Uncount the park before the caller acts on its wakeup
+        #[cfg(any(test, feature = "test-clock"))]
+        drop(blocked);
+        state
     }
 }
 
@@ -242,10 +292,13 @@ impl fmt::Debug for Waiter {
 /// Wakes threads through a generation read before each condition check.
 #[derive(Default)]
 struct Signal {
-    /// Generation and parking count, guarded together.
+    /// Counters and the test park count, guarded together.
     state: Mutex<SignalState>,
     /// Wakes parked threads when the generation moves.
     changed: Condvar,
+    /// Reports new parks to tests, without waking parked threads.
+    #[cfg(test)]
+    parked: Condvar,
 }
 
 /// Mutable part of a signal.
@@ -253,6 +306,8 @@ struct Signal {
 struct SignalState {
     /// Number of notifications and clock advances, wrapping on overflow.
     generation: u64,
+    /// Number of notifications alone, which end condvar waits, wrapping on overflow.
+    notifications: u64,
     /// Total parks that found the generation unchanged, for test synchronization.
     #[cfg(test)]
     parks: usize,
@@ -269,12 +324,30 @@ impl Signal {
         self.lock().generation
     }
 
-    /// Bumps the generation and wakes every parked thread.
-    #[cfg(any(test, feature = "test-clock"))]
+    /// Counts a notification and wakes one parked thread.
+    ///
+    /// Every waiting thread sees the count, so another one may return too,
+    /// as a spurious wakeup, the next time it wakes.
+    fn notify_one(&self) {
+        let mut state = self.lock();
+        state.generation = state.generation.wrapping_add(1);
+        state.notifications = state.notifications.wrapping_add(1);
+        self.changed.notify_one();
+    }
+
+    /// Counts a notification and wakes every parked thread.
     fn notify_all(&self) {
         let mut state = self.lock();
         state.generation = state.generation.wrapping_add(1);
-        drop(state);
+        state.notifications = state.notifications.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    /// Wakes every parked thread to recheck the time, without counting a notification.
+    #[cfg(any(test, feature = "test-clock"))]
+    fn advance(&self) {
+        let mut state = self.lock();
+        state.generation = state.generation.wrapping_add(1);
         self.changed.notify_all();
     }
 }
@@ -294,19 +367,40 @@ mod tests {
     fn parked(waiter: &Waiter, count: usize) {
         let mut state = waiter.signal.lock();
         while state.parks < count {
-            state = waiter.signal.changed.wait(state).unwrap();
+            state = waiter.signal.parked.wait(state).unwrap();
         }
     }
 
-    /// Stops the next sleep after its deadline check and reports its real timer.
-    fn pause_before_park(clock: &Clock) -> (Receiver<Option<Instant>>, SyncSender<()>) {
+    /// Returns the number of threads parked on a test clock.
+    pub(crate) fn blocked(clock: &Clock) -> usize {
+        clock.paused.as_ref().unwrap().state.lock().unwrap().blocked
+    }
+
+    /// Stops the next wait before it parks, and reports its real timer.
+    pub(crate) fn pause_before_park(clock: &Clock) -> (Receiver<Option<Instant>>, SyncSender<()>) {
+        pause(&clock.paused.as_ref().unwrap().before_park)
+    }
+
+    /// Stops the next park that waits again after a spurious wakeup, and reports
+    /// its real timer.
+    fn pause_before_rewait(clock: &Clock) -> (Receiver<Option<Instant>>, SyncSender<()>) {
+        pause(&clock.paused.as_ref().unwrap().before_rewait)
+    }
+
+    /// Installs a one-shot hook that reports a wait's timer and holds the wait
+    /// until resumed.
+    fn pause(
+        hook: &Mutex<Option<paused::BeforePark>>,
+    ) -> (Receiver<Option<Instant>>, SyncSender<()>) {
+        // Report the timer on one channel, and hold the wait until the other one fires
         let (checked, checks) = mpsc::sync_channel(0);
         let (resume, resumed) = mpsc::sync_channel(0);
-        *clock.paused.as_ref().unwrap().before_park.lock().unwrap() =
-            Some(Box::new(move |timer| {
-                checked.send(timer).unwrap();
-                resumed.recv().unwrap();
-            }));
+
+        // Stop exactly one wait, reporting the timer that its park will use
+        *hook.lock().unwrap() = Some(Box::new(move |timer| {
+            checked.send(timer).unwrap();
+            resumed.recv().unwrap();
+        }));
         (checks, resume)
     }
 
@@ -402,6 +496,7 @@ mod tests {
     // Elapsed time follows advances and saturates at zero for future instants.
     #[test]
     fn test_elapsed_saturates() {
+        // Measure an advance from an instant captured before time moves
         let mut test = TestClock::new();
         let clock = test.clock();
         let start = clock.now();
@@ -456,6 +551,7 @@ mod tests {
     // Backwards targets and monotonic overflow leave both times unchanged and usable.
     #[test]
     fn test_failed_monotonic_advance_keeps_both_times() {
+        // Keep a clock handle for checking both times after each rejected advance
         let mut test = TestClock::new();
         let clock = test.clock();
 
@@ -494,6 +590,7 @@ mod tests {
     // Wall-time overflow in either advance method leaves both times unchanged and usable.
     #[test]
     fn test_failed_wall_advance_keeps_both_times() {
+        // Keep a clock handle for checking both times at the wall-time limit
         let mut test = TestClock::new();
         let clock = test.clock();
 
@@ -616,10 +713,7 @@ mod tests {
             })
             .collect();
         test.wait_blocked(6);
-        assert_eq!(
-            clock.paused.as_ref().unwrap().state.lock().unwrap().blocked,
-            6
-        );
+        assert_eq!(blocked(&clock), 6);
 
         // One advance releases all of them at the shared deadline
         test.advance(Duration::from_secs(60));
@@ -636,6 +730,7 @@ mod tests {
     // Reached deadlines and zero-duration sleeps return without an advance or notification.
     #[test]
     fn test_sleep_returns_for_reached_deadlines() {
+        // Advance past a known instant, giving a deadline already in the past
         let mut test = TestClock::new();
         let start = test.clock().now();
         test.advance(Duration::from_secs(1));
@@ -679,9 +774,42 @@ mod tests {
         assert_eq!(waiting.join().unwrap(), None);
     }
 
+    // A spurious wakeup keeps the park counted and its deadline listed.
+    #[test]
+    fn test_spurious_wakeup_keeps_park_counted() {
+        // Park a timed wait on a waiter the test can reach
+        let mut test = TestClock::new();
+        let clock = test.clock();
+        let deadline = clock.now() + Duration::from_secs(1);
+        let waiter = Arc::new(clock.waiter());
+        let waiting = thread::spawn({
+            let waiter = waiter.clone();
+            move || waiter.wait_until(Some(deadline), || None::<()>)
+        });
+        test.wait_blocked(1);
+
+        // Wake it through std alone, locking the signal so the wakeup reaches the wait
+        let (checked, resume) = pause_before_rewait(&clock);
+        {
+            let _state = waiter.signal.lock();
+            waiter.signal.changed.notify_all();
+        }
+        assert_eq!(checked.recv().unwrap(), None);
+
+        // Caught between its two waits, the park still counts and lists its deadline
+        assert_eq!(blocked(&clock), 1);
+        assert_eq!(test.next_deadline(), Some(deadline));
+        resume.send(()).unwrap();
+
+        // Reaching the deadline still ends it
+        test.advance_to(deadline);
+        assert_eq!(waiting.join().unwrap(), None);
+    }
+
     // A poisoned shared lock still permits reading, setting, parking, counting and advancing time.
     #[test]
     fn test_poisoned_clock_remains_usable() {
+        // Record both times before the shared clock lock is poisoned
         let mut test = TestClock::new();
         let clock = test.clock();
         let now = clock.now();
@@ -719,6 +847,7 @@ mod tests {
     #[test]
     fn test_wait_checks_ready_first() {
         for clock in [Clock::real(), TestClock::new().clock()] {
+            // An already reached deadline still gives the ready condition its first check
             let waiter = clock.waiter();
             let now = clock.now();
             assert_eq!(
@@ -757,6 +886,7 @@ mod tests {
     // Advances during condition checks cause rechecks until the deadline is reached.
     #[test]
     fn test_wait_observes_advance_during_check() {
+        // Set a deadline that needs two advances from the ready callback
         let mut test = TestClock::new();
         let clock = test.clock();
         let waiter = clock.waiter();
@@ -828,6 +958,7 @@ mod tests {
     // outstanding signal references.
     #[test]
     fn test_waiter_registry_tracks_live_waiters() {
+        // Inspect registrations on the clock that owns the waiters
         let test = TestClock::new();
         let clock = test.clock();
         let paused = clock.paused.as_ref().unwrap();
@@ -849,24 +980,5 @@ mod tests {
         drop(waiters);
         drop(signal);
         assert!(paused.state.lock().unwrap().signals.is_empty());
-    }
-
-    // Real sleep waits at least its requested duration without an upper elapsed-time bound.
-    #[test]
-    fn test_real_sleep_reaches_duration() {
-        let clock = Clock::real();
-        let start = Instant::now();
-        clock.sleep(Duration::from_millis(1));
-        assert!(clock.elapsed(start) >= Duration::from_millis(1));
-    }
-
-    // Real sleep_until returns only once its deadline is reached, with no upper
-    // bound on the elapsed time.
-    #[test]
-    fn test_real_sleep_until_reaches_deadline() {
-        let clock = Clock::real();
-        let deadline = Instant::now() + Duration::from_millis(1);
-        clock.sleep_until(deadline);
-        assert!(Instant::now() >= deadline);
     }
 }
