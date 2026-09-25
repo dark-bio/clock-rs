@@ -105,6 +105,9 @@ impl TestClock {
 
     /// Validates both new times before updating state and notifying waiters.
     fn advance_with(&mut self, next: impl FnOnce(Instant) -> Instant) {
+        // Compute and check the new times outside the lock, so a failed check's
+        // panic runs no hook under it. Only the owner advances, so nothing
+        // changes the times in between.
         let (now, system_time) = {
             let state = self.paused.lock();
             (state.now, state.system_time)
@@ -116,6 +119,8 @@ impl TestClock {
         let system_time = system_time
             .checked_add(next - now)
             .expect("clock advance overflows SystemTime");
+
+        // Publish both times and collect the live waiters in one critical section
         let mut state = self.paused.lock();
         let signals: Vec<_> = state.signals.values().filter_map(Weak::upgrade).collect();
         state.now = next;
