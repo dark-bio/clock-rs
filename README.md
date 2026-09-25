@@ -5,15 +5,15 @@
 [![](https://github.com/dark-bio/clock-rs/workflows/tests/badge.svg)](https://github.com/dark-bio/clock-rs/actions/workflows/ci.yml)
 [![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](https://github.com/dark-bio/clock-rs/blob/main/LICENSE)
 
-This crate provides a clock that tests can pause and advance, and blocking waits that follow it. Code under test reads time and measures deadlines through a `Clock` handle instead of `Instant::now`. Production hands it the real monotonic clock, while tests hand it a paused one that moves only when advanced.
+This crate provides a clock that tests can stop and advance, with blocking sleeps that follow it. Code reads monotonic time, wall time and elapsed durations through a `Clock` handle instead of std's free functions. Production passes `Clock::real()`, and tests pass a clock from a `TestClock`, which moves only when the test advances it.
 
-A `Waiter` blocks a thread until a condition holds or a deadline passes on its clock. Advancing a paused clock wakes its waiters, so a test runs a 5 s timeout without waiting 5 s. The waits block ordinary threads, with no async runtime involved.
+The sleeps block ordinary threads, with no async runtime involved. Advancing a test clock wakes them, so a test runs a 5 s timeout without waiting 5 s.
 
 Clocks are explicit handles, never globals or thread-locals. Parallel tests each own their clock, and worker threads follow the one they were handed.
 
 ## Quick start
 
-Reading a clock and waiting on it work in every build. Pausing and advancing need the `test-clock` feature, and a build without it cannot pause its clock. Enable it only on a dev-dependency, since Cargo unifies features across a build. Pick the same version as the regular dependency, so the feature reaches the copy the code uses.
+Reading a clock and sleeping on it work in every build. `TestClock` needs the `test-clock` feature, and without it `Clock` is zero-sized and always real. Enable the feature only on a dev-dependency, since Cargo unifies features across a build. Pick the same version as the regular dependency, so the feature reaches the copy the code uses.
 
 ```toml
 [dependencies]
@@ -25,31 +25,43 @@ darkbio-clock = { version = "0.1", features = ["test-clock"] }
 
 ```rust
 # #[cfg(feature = "test-clock")] {
-use darkbio_clock::Clock;
+use darkbio_clock::TestClock;
 use std::thread;
 use std::time::Duration;
 
-let clock = Clock::paused();
-let deadline = clock.now() + Duration::from_secs(5);
-let waiter = clock.waiter();
-let waiting = thread::spawn(move || waiter.wait_until(Some(deadline), || None::<()>));
+let mut test = TestClock::new();
+let clock = test.clock();
+let sleeper = thread::spawn(move || clock.sleep(Duration::from_secs(5)));
 
-clock.advance(Duration::from_secs(5));
-assert_eq!(waiting.join().unwrap(), None);
+test.wait_blocked(1);
+test.advance(Duration::from_secs(5));
+sleeper.join().unwrap();
 # }
 ```
 
-## Testing on a paused clock
+Each call mirrors the std call it replaces, with the same arguments and results.
 
-- A paused clock never moves by itself, so a deadline nobody advances to never passes. Run such tests under a runner that stops hung tests.
-- An advance returns once the waiters are notified, not once they have acted. Wait for the effect itself, such as a result or a message, before checking it.
-- Take deadlines from the waiter's own clock. An `Instant` does not record its clock, so a deadline from `Instant::now()` is silently read as paused time.
-- A thread that takes its deadline after an advance waits for a later time. Take deadlines before advancing, not in a thread that may run after it.
-- An advance jumps straight to its target, and changes that land together wake a waiter once. Where every period matters, advance one period and wait for its effect before the next.
-- Waiters recheck their condition only when notified or when the clock moves. Notify after every change a condition reads, including closing.
-- Dropping a clock does not end the waits on it. Before joining a waiting thread, make its condition ready and notify, or advance past its deadline.
-- Only code that reads the clock follows it. `Instant::now`, `thread::sleep`, timed channel receives and `SystemTime` all stay on real time.
-- Pausing time does not order threads, and advances from several threads race each other. Drive a paused clock from one thread.
+| std | darkbio-clock |
+|---|---|
+| `Instant::now()` | `clock.now()` |
+| `start.elapsed()` | `clock.elapsed(start)` |
+| `SystemTime::now()` | `clock.system_time()` |
+| `thread::sleep(duration)` | `clock.sleep(duration)` |
+| `thread::sleep_until(deadline)` | `clock.sleep_until(deadline)` |
+
+A test clock starts at the real monotonic and wall times and moves both on every advance. `set_system_time` jumps wall time alone, forwards or backwards, the way an NTP correction does.
+
+## Testing on a test clock
+
+- A test clock never moves by itself, so a deadline nobody advances to never passes. Run such tests under a runner that stops hung tests.
+- Only the `TestClock` moves time, and its controls take `&mut self`, so each clock has one driver. A `Clock` handle reads and sleeps, but cannot advance.
+- An advance returns once sleepers are notified, not once they have acted. Wait for the effect itself, such as a result or a message, before checking it.
+- `wait_blocked(n)` returns once at least `n` threads are parked on the clock. A thread parked earlier counts too, so it proves no progress on its own.
+- A sleep takes its deadline when it is called, so a sleep that starts after an advance waits for a later time. Wait with `wait_blocked` before advancing, or take the deadline first and use `sleep_until`.
+- Take deadlines from the handle's own clock. An `Instant` does not record its clock, so a deadline from `Instant::now()` is silently read as test time.
+- An advance jumps straight to its target. Where every period matters, advance one period and wait for its effect before the next.
+- Dropping the `TestClock` leaves its sleepers parked for good. Advance past their deadlines before dropping it.
+- Only calls through the clock follow it. std's own time reads, sleeps, condvar timeouts and timed channel receives stay on real time.
 
 ## License
 
