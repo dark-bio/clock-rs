@@ -4,123 +4,191 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! Paused clocks, which move only when a test advances them.
+//! Test clocks, which move only when their owner advances them.
 
 use crate::{Clock, Signal};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::{Duration, Instant, SystemTime};
 
+/// Owns a clock that moves only when advanced, for tests.
+///
+/// [`Self::clock`] hands out handles that read and sleep on its time. Only the
+/// owner moves it, through methods that take `&mut self`, so each test clock
+/// has one driver.
 #[cfg_attr(docsrs, doc(cfg(feature = "test-clock")))]
-impl Clock {
-    /// Creates a paused clock, set to the current real time. It moves only
-    /// when [`Clock::advance`] or [`Clock::advance_to`] moves it.
-    pub fn paused() -> Self {
+pub struct TestClock {
+    /// State shared with every clock handle.
+    paused: Arc<Paused>,
+}
+
+impl TestClock {
+    /// Creates a stopped clock at the current real monotonic and wall times.
+    pub fn new() -> Self {
         let now = Instant::now();
         Self {
-            paused: Some(Arc::new(Paused {
+            paused: Arc::new(Paused {
                 start: now,
                 state: Mutex::new(PausedState {
                     now,
-                    signals: Vec::new(),
+                    system_time: SystemTime::now(),
+                    signals: BTreeMap::new(),
+                    blocked: 0,
                 }),
-            })),
+                changed: Condvar::new(),
+                #[cfg(test)]
+                before_park: Mutex::new(None),
+            }),
         }
     }
 
-    /// Moves a paused clock forward by `by` and wakes all its waiters. It
-    /// returns once they are notified, without waiting for them to act. A zero
-    /// step does nothing.
+    /// Returns a handle that reads and sleeps on this clock.
+    pub fn clock(&self) -> Clock {
+        Clock {
+            paused: Some(self.paused.clone()),
+        }
+    }
+
+    /// Moves both times forward by `by` and wakes every parked wait.
+    ///
+    /// Returns once waits are notified, without waiting for them to act.
+    /// A zero advance does nothing.
     ///
     /// # Panics
     ///
-    /// Panics on a real clock, or if the new time overflows [`Instant`]. The time
-    /// is unchanged after a panic.
-    pub fn advance(&self, by: Duration) {
+    /// Panics if either time would overflow, before changing either one.
+    pub fn advance(&mut self, by: Duration) {
         self.advance_with(|now| {
             now.checked_add(by)
                 .expect("clock advance overflows Instant")
         });
     }
 
-    /// Moves a paused clock forward to `target` and wakes all its waiters. It
-    /// returns once they are notified, without waiting for them to act.
+    /// Moves monotonic time to `target` and wall time by the same amount.
+    ///
+    /// Wakes every parked wait and returns without waiting for them to act.
     /// Advancing to the current time does nothing.
     ///
     /// # Panics
     ///
-    /// Panics on a real clock, or if `target` is earlier than the current time.
-    /// The time is unchanged after a panic.
-    pub fn advance_to(&self, target: Instant) {
+    /// Panics if `target` is before now or wall time would overflow.
+    /// Neither time changes after a panic.
+    pub fn advance_to(&mut self, target: Instant) {
         self.advance_with(|now| {
             assert!(target >= now, "clock cannot go backwards");
             target
         });
     }
 
-    /// Moves a paused clock to the time `next` picks from the current one, then
-    /// wakes its waiters. `next` panics on a bad step before anything changes.
-    fn advance_with(&self, next: impl FnOnce(Instant) -> Instant) {
-        let Some(paused) = &self.paused else {
-            panic!("real clock cannot be advanced");
+    /// Sets wall time forwards or backwards without moving monotonic time.
+    ///
+    /// This wakes no waits, since their deadlines use monotonic time.
+    pub fn set_system_time(&mut self, time: SystemTime) {
+        self.paused.lock().system_time = time;
+    }
+
+    /// Blocks until at least `count` threads are parked in this clock's sleeps.
+    ///
+    /// A thread parked earlier counts too, so the count proves no progress on
+    /// its own. Nothing bounds the wait, so the test runner ends a hang.
+    pub fn wait_blocked(&self, count: usize) {
+        let mut state = self.paused.lock();
+        while state.blocked < count {
+            state = self
+                .paused
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Validates both new times before updating state and notifying waiters.
+    fn advance_with(&mut self, next: impl FnOnce(Instant) -> Instant) {
+        let (now, system_time) = {
+            let state = self.paused.lock();
+            (state.now, state.system_time)
         };
-        let mut state = paused.lock();
-        let now = next(state.now);
-        if now == state.now {
+        let next = next(now);
+        if next == now {
             return;
         }
-        state.now = now;
-        let mut signals = Vec::with_capacity(state.signals.len());
-        state.signals.retain(|signal| match signal.upgrade() {
-            Some(signal) => {
-                signals.push(signal);
-                true
-            }
-            None => false,
-        });
+        let system_time = system_time
+            .checked_add(next - now)
+            .expect("clock advance overflows SystemTime");
+        let mut state = self.paused.lock();
+        let signals: Vec<_> = state.signals.values().filter_map(Weak::upgrade).collect();
+        state.now = next;
+        state.system_time = system_time;
         drop(state);
 
-        // Wake outside the clock lock, so woken threads can read the time at once
+        // Wake outside the clock lock, since parking takes the signal lock first
         for signal in signals {
             signal.notify_all();
         }
     }
 }
 
-impl PartialEq for Clock {
-    /// Compares identity. Real clocks are all equal; a paused clock equals only
-    /// its own clones.
-    fn eq(&self, other: &Self) -> bool {
-        match (&self.paused, &other.paused) {
-            (None, None) => true,
-            (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs),
-            _ => false,
-        }
+impl Default for TestClock {
+    /// Creates a stopped clock at the current real monotonic and wall times.
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl Eq for Clock {}
+impl fmt::Debug for TestClock {
+    /// Shows the advance, wall time and number of parked threads.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (advanced, system_time, blocked) = {
+            let state = self.paused.lock();
+            (
+                state.now - self.paused.start,
+                state.system_time,
+                state.blocked,
+            )
+        };
+        f.debug_struct("TestClock")
+            .field("advanced", &advanced)
+            .field("system_time", &system_time)
+            .field("blocked", &blocked)
+            .finish()
+    }
+}
 
-/// A paused clock's state, shared by its clones and its waiters.
+/// A test clock's state, shared by its owner, handles and waiters.
 pub(crate) struct Paused {
     /// Time the clock started at, to show how far it has advanced.
     start: Instant,
-    /// Current time and the waiters to wake when it moves.
-    state: Mutex<PausedState>,
+    /// Current times, live waiters and parked thread count.
+    pub(crate) state: Mutex<PausedState>,
+    /// Wakes drivers when the parked thread count increases.
+    changed: Condvar,
+    /// One-shot test hook between a failed deadline check and its park.
+    #[cfg(test)]
+    pub(crate) before_park: Mutex<Option<BeforePark>>,
 }
 
-/// Mutable part of a paused clock.
-struct PausedState {
-    /// Current time of the clock.
+/// Mutable part of a test clock.
+pub(crate) struct PausedState {
+    /// Current monotonic time.
     now: Instant,
-    /// Signals of the clock's waiters. Entries of dropped waiters are pruned
-    /// when advancing and before the list grows.
-    signals: Vec<Weak<Signal>>,
+    /// Current wall time, independent of monotonic time when set explicitly.
+    system_time: SystemTime,
+    /// Live waiters indexed by signal address, removed when each waiter drops.
+    pub(crate) signals: BTreeMap<usize, Weak<Signal>>,
+    /// Threads committed to parking while holding their signal's lock.
+    pub(crate) blocked: usize,
 }
 
 impl Paused {
-    /// Returns the clock's current time.
+    /// Returns the clock's current monotonic time.
     pub(crate) fn now(&self) -> Instant {
         self.lock().now
+    }
+
+    /// Returns the clock's current wall time.
+    pub(crate) fn system_time(&self) -> SystemTime {
+        self.lock().system_time
     }
 
     /// Returns how far the clock has advanced since its creation.
@@ -128,19 +196,54 @@ impl Paused {
         self.lock().now - self.start
     }
 
-    /// Registers a waiter's signal to wake on every advance.
+    /// Registers a waiter's signal before its first generation check.
     pub(crate) fn register(&self, signal: &Arc<Signal>) {
-        let mut state = self.lock();
-        // Prune dropped waiters before the list grows, so it tracks the live ones
-        if state.signals.len() == state.signals.capacity() {
-            state.signals.retain(|signal| signal.strong_count() > 0);
-        }
-        state.signals.push(Arc::downgrade(signal));
+        self.lock()
+            .signals
+            .insert(Arc::as_ptr(signal) as usize, Arc::downgrade(signal));
     }
 
-    /// Locks the state. An advance panics before it writes anything, so a lock
-    /// poisoned by that panic still guards a consistent state.
+    /// Removes a waiter's signal without retaining storage for dead waiters.
+    pub(crate) fn unregister(&self, signal: &Arc<Signal>) {
+        self.lock().signals.remove(&(Arc::as_ptr(signal) as usize));
+    }
+
+    /// Counts a park until its guard drops, while the caller holds its signal lock.
+    pub(crate) fn block(&self) -> Blocked<'_> {
+        self.lock().blocked += 1;
+        self.changed.notify_all();
+        Blocked { paused: self }
+    }
+
+    /// Runs a test hook without holding any clock or signal lock.
+    #[cfg(test)]
+    pub(crate) fn check_park(&self, timer: Option<Instant>) {
+        let hook = self.before_park.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(timer);
+        }
+    }
+
+    /// Locks the state, recovering it from poisoning, since no update under the
+    /// lock can stop halfway.
     fn lock(&self) -> MutexGuard<'_, PausedState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
+
+/// Counts one parked thread until its signal lock is retaken after waking.
+pub(crate) struct Blocked<'a> {
+    /// Clock whose parked count includes this thread.
+    paused: &'a Paused,
+}
+
+impl Drop for Blocked<'_> {
+    /// Removes this thread from the clock's parked count.
+    fn drop(&mut self) {
+        self.paused.lock().blocked -= 1;
+    }
+}
+
+/// Pauses a test sleep before parking and exposes its real timer, if any.
+#[cfg(test)]
+type BeforePark = Box<dyn FnOnce(Option<Instant>) + Send>;
