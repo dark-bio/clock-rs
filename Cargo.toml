@@ -1,0 +1,23 @@
+[package]
+name = "darkbio-clock"
+version = "0.1.0"
+authors = ["Péter Szilágyi <peter@dark.bio>"]
+description = "Virtual clock for testing blocking code"
+repository = "https://github.com/dark-bio/clock-rs"
+documentation = "https://docs.rs/darkbio-clock"
+categories = ["development-tools::testing", "date-and-time"]
+keywords = ["clock", "time", "testing", "virtual-time", "dark-bio"]
+license = "BSD-3-Clause"
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
+[features]
+default = []
+test-clock = []
