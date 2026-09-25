@@ -6,10 +6,16 @@
 
 //! Probes for the recommended clippy configuration against real-time calls.
 //!
+//! This package is internal and never published. Users copy the configuration
+//! from the README's "Linting real-time calls" section into their own
+//! clippy.toml, since clippy cannot inherit one from a dependency, and this
+//! package keeps that copy honest. lint/clippy.toml holds the list, and a test
+//! below checks that the README carries it verbatim.
+//!
 //! Each probe calls one disallowed path under an expectation of the lint, so a
 //! path that stops matching fails clippy with warnings denied. The legal probes
 //! expect nothing and must stay clean, including the timed selects that escape
-//! the lint.
+//! the lint. `make lint` runs it all, and so do `make check` and CI.
 
 #![forbid(unsafe_code)]
 

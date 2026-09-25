@@ -13,7 +13,7 @@ Clocks are explicit handles, never globals or thread-locals. Parallel tests each
 
 ## Quick start
 
-Reading a clock, sleeping on it and waiting on its condvars work in every build. The timers need the `crossbeam` feature, and `TestClock` needs the `test-clock` feature. Without `test-clock`, `Clock` is zero-sized and always real. Enable that feature only on a dev-dependency, since Cargo unifies features across a build. Pick the same version as the regular dependency, so the feature reaches the copy the code uses.
+Reading a clock, sleeping on it and waiting on its condvars work in every build. Timers need the `crossbeam` feature, and `TestClock` needs `test-clock`, without which `Clock` is zero-sized and always real. Enable `test-clock` only on a dev-dependency, since Cargo unifies features across a build. Pick the same version as the regular dependency, so the feature reaches the copy the code uses.
 
 ```toml
 [dependencies]
@@ -29,15 +29,19 @@ use darkbio_clock::TestClock;
 use std::thread;
 use std::time::Duration;
 
-let mut test = TestClock::new();
-let clock = test.clock();
+let mut tester = TestClock::new();
+let clock = tester.clock();
 let sleeper = thread::spawn(move || clock.sleep(Duration::from_secs(5)));
 
-test.wait_blocked(1);
-test.advance(Duration::from_secs(5));
+tester.wait_blocked(1);
+tester.advance(Duration::from_secs(5));
 sleeper.join().unwrap();
 # }
 ```
+
+The sleeper parks on the test clock, `wait_blocked` returns once it has, and the advance releases it without any real waiting.
+
+## Replacing std and crossbeam calls
 
 Each call mirrors the std or crossbeam call it replaces. The clock is the receiver of the time calls and an argument when creating a condvar, and a timed condvar wait takes a deadline in place of a timeout.
 
@@ -56,8 +60,6 @@ Each call mirrors the std or crossbeam call it replaces. The clock is the receiv
 | `receiver.recv_deadline(t)` | `clock.recv_deadline(&receiver, t)` |
 
 `Mutex` and `Condvar` come from this crate's `sync` module in place of `std::sync`. Everything else they offer keeps std's names, arguments, results and poisoning.
-
-A test clock starts at the real monotonic and wall times and moves both on every advance. `set_system_time` jumps wall time alone, forwards or backwards, the way an NTP correction does.
 
 ## Locks
 
@@ -79,17 +81,27 @@ crossbeam's timers never disconnect, but a crossbeam sender cannot tell that its
 
 ## Testing on a test clock
 
-- A test clock never moves by itself, so a deadline nobody advances to never passes. Run such tests under a runner that stops hung tests.
-- Only the `TestClock` moves time, and its controls take `&mut self`, so each clock has one driver. A `Clock` handle reads, sleeps and creates condvars and timers, but cannot advance.
-- An advance returns once the sleeps and deadline waits it reaches are notified and its due timers hold their messages, not once any thread has acted. Wait for the effect itself, such as a result or a message, before checking it.
-- `wait_blocked(n)` returns once at least `n` threads are parked in the clock's sleeps and condvar waits, timed or not. Threads blocked in a crossbeam receive or `select!` are invisible to it. A thread parked earlier counts too, so it proves no progress on its own.
-- With `crossbeam`, `wait_timers(n)` returns once at least `n` timers are armed on the clock and unfired, counting those of waiting receives. A timer armed earlier counts too, so it proves no progress on its own.
-- `next_deadline()` returns the earliest deadline among the clock's parked sleeps, deadline waits and unfired timers, and advancing to it runs a test to its next timeout. A woken wait stays listed until its thread runs, so await an advance's effect before reading the next deadline.
-- A sleep takes its deadline when it is called, so a sleep that starts after an advance waits for a later time. Wait with `wait_blocked` before advancing, or take the deadline first and use `sleep_until`.
-- Take deadlines from the handle's own clock. An `Instant` does not record its clock, so a deadline from `Instant::now()` is silently read as test time.
-- An advance jumps straight to its target. Where every period matters, advance one period and wait for its effect before the next.
-- Dropping the `TestClock` stops all advances, so its parked sleeps never end, its condvar waits end only when notified, and its unfired timers never fire. Advance past their deadlines before dropping it.
-- Only calls through the clock follow it. std's and crossbeam's own time reads, sleeps, timeouts and timers stay on real time, and the lint below flags them.
+### Moving time
+
+A test clock starts at the real monotonic and wall times. `advance` and `advance_to` move both together, and `set_system_time` jumps wall time alone, forwards or backwards, the way an NTP correction does. Only the `TestClock` moves time, and its controls take `&mut self`, so each clock has one driver. A `Clock` handle reads, sleeps and creates condvars and timers, but cannot advance.
+
+An advance jumps straight to its target. Where every period matters, advance one period and wait for its effect before the next. A test clock never moves by itself, so a deadline nobody advances to never passes, and such tests belong under a runner that stops hung tests.
+
+Dropping the `TestClock` stops all advances. Its parked sleeps then never end, its condvar waits end only when notified, and its unfired timers never fire, so advance past their deadlines before dropping it.
+
+### Waiting for threads
+
+An advance returns once the sleeps and deadline waits it reaches are notified and its due timers hold their messages, not once any thread has acted. Wait for the effect itself, such as a result or a message, before checking it.
+
+`wait_blocked(n)` returns once at least `n` threads are parked in the clock's sleeps and condvar waits, timed or not. Threads blocked in a crossbeam receive or `select!` are invisible to it, so with `crossbeam`, `wait_timers(n)` waits for at least `n` armed timers instead, counting those of waiting receives. An earlier park or timer counts too, so neither count proves progress on its own.
+
+`next_deadline()` returns the earliest deadline among the clock's parked sleeps, deadline waits and unfired timers, and advancing to it runs a test to its next timeout. A woken wait stays listed until its thread runs, so await an advance's effect before reading the next deadline.
+
+### Deadlines
+
+A sleep takes its deadline when it is called, so a sleep that starts after an advance waits for a later time. Wait with `wait_blocked` before advancing, or take the deadline first and use `sleep_until`.
+
+Take deadlines from the handle's own clock. An `Instant` does not record its clock, so a deadline from `Instant::now()` is silently read as test time. Only calls through the clock follow it, and std's and crossbeam's own time reads, sleeps, timeouts and timers stay on real time, which the lint below flags.
 
 ## Linting real-time calls
 

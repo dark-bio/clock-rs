@@ -32,12 +32,12 @@ fn test_clock_identity_and_shared_time() {
     // Create the clocks between two real readings, to bound their start
     let before = Instant::now();
     let mut other = TestClock::new();
-    let mut test = TestClock::new();
+    let mut tester = TestClock::new();
     let real_now = REAL.now();
     let after = Instant::now();
 
     // A test clock starts at the real time, with no offset
-    let clock = test.clock();
+    let clock = tester.clock();
     let clone = clock.clone();
     let other_start = other.clock().now();
     let start = clock.now();
@@ -45,10 +45,10 @@ fn test_clock_identity_and_shared_time() {
     assert!((before..=after).contains(&real_now));
 
     // Advancing one test clock moves all its handles and leaves the other alone
-    test.advance(Duration::from_secs(1));
+    tester.advance(Duration::from_secs(1));
     assert_eq!(clone.now(), start + Duration::from_secs(1));
     assert_eq!(other.clock().now(), other_start);
-    test.advance_to(start + Duration::from_secs(3));
+    tester.advance_to(start + Duration::from_secs(3));
     assert_eq!(clock.now(), start + Duration::from_secs(3));
 
     // Equal times do not make separate clocks equal, since equality is identity
@@ -57,7 +57,7 @@ fn test_clock_identity_and_shared_time() {
     assert_eq!(other.clock().now(), clock.now());
     assert_eq!(other.clock().system_time(), clock.system_time());
     assert_eq!(clock, clone);
-    assert_eq!(clock, test.clock());
+    assert_eq!(clock, tester.clock());
     assert_ne!(clock, other.clock());
 
     // Real clocks equal each other and never a test clock
@@ -87,14 +87,14 @@ fn test_debug_writer_can_read_clock() {
     }
 
     // Format a test clock into a writer that reads the same clock on every write
-    let test = TestClock::new();
+    let tester = TestClock::new();
     #[cfg(feature = "crossbeam")]
-    let _timer = test.clock().after(Duration::from_secs(5));
+    let _timer = tester.clock().after(Duration::from_secs(5));
     let mut writer = ClockWriter {
-        clock: test.clock(),
+        clock: tester.clock(),
         output: String::new(),
     };
-    fmt::write(&mut writer, format_args!("{test:?}")).unwrap();
+    fmt::write(&mut writer, format_args!("{tester:?}")).unwrap();
 
     // Returning at all shows no lock was held while writing, and every field came out
     for field in ["advanced:", "system_time:", "blocked:"] {
@@ -108,10 +108,10 @@ fn test_debug_writer_can_read_clock() {
 #[test]
 fn test_elapsed_saturates() {
     // Measure an advance from an instant captured before time moves
-    let mut test = TestClock::new();
-    let clock = test.clock();
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
     let start = clock.now();
-    test.advance(Duration::from_secs(3));
+    tester.advance(Duration::from_secs(3));
     assert_eq!(clock.elapsed(start), Duration::from_secs(3));
 
     // Nothing has elapsed since now, nor since an instant still ahead
@@ -127,34 +127,34 @@ fn test_elapsed_saturates() {
 fn test_system_time_follows_advances_and_jumps_alone() {
     // Create the clocks between two real wall readings, to bound their start
     let before = SystemTime::now();
-    let mut test = TestClock::default();
+    let mut tester = TestClock::default();
     let real_time = Clock::real().system_time();
     let after = SystemTime::now();
 
     // Both the test clock and the real clock start at the real wall time
-    let clock = test.clock();
+    let clock = tester.clock();
     let start = clock.now();
     assert!((before..=after).contains(&clock.system_time()));
     assert!((before..=after).contains(&real_time));
 
     // Pin wall time to a known value, then check that both advances move it
-    test.set_system_time(UNIX_EPOCH + Duration::from_secs(100));
-    test.advance(Duration::from_secs(7));
+    tester.set_system_time(UNIX_EPOCH + Duration::from_secs(100));
+    tester.advance(Duration::from_secs(7));
     assert_eq!(clock.now(), start + Duration::from_secs(7));
     assert_eq!(clock.system_time(), UNIX_EPOCH + Duration::from_secs(107));
-    test.advance_to(start + Duration::from_secs(10));
+    tester.advance_to(start + Duration::from_secs(10));
     assert_eq!(clock.system_time(), UNIX_EPOCH + Duration::from_secs(110));
 
     // Jump wall time forwards and then backwards, leaving monotonic time in place
     for seconds in [200, 50] {
         let time = UNIX_EPOCH + Duration::from_secs(seconds);
-        test.set_system_time(time);
+        tester.set_system_time(time);
         assert_eq!(clock.system_time(), time, "{seconds}");
         assert_eq!(clock.now(), start + Duration::from_secs(10), "{seconds}");
     }
 
     // A later advance continues from the jumped wall time
-    test.advance(Duration::from_secs(1));
+    tester.advance(Duration::from_secs(1));
     assert_eq!(clock.system_time(), UNIX_EPOCH + Duration::from_secs(51));
     assert_eq!(clock.now(), start + Duration::from_secs(11));
 }
@@ -163,11 +163,11 @@ fn test_system_time_follows_advances_and_jumps_alone() {
 #[test]
 fn test_failed_monotonic_advance_keeps_both_times() {
     // Keep a clock handle for checking both times after each rejected advance
-    let mut test = TestClock::new();
-    let clock = test.clock();
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
 
     // Move past the start, so the backwards target below is a valid instant
-    test.advance(Duration::from_secs(1));
+    tester.advance(Duration::from_secs(1));
     for backwards in [true, false] {
         let now = clock.now();
         let wall = clock.system_time();
@@ -176,9 +176,9 @@ fn test_failed_monotonic_advance_keeps_both_times() {
         assert!(
             panic::catch_unwind(AssertUnwindSafe(|| {
                 if backwards {
-                    test.advance_to(now - Duration::from_secs(1));
+                    tester.advance_to(now - Duration::from_secs(1));
                 } else {
-                    test.advance(Duration::MAX);
+                    tester.advance(Duration::MAX);
                 }
             }))
             .is_err(),
@@ -188,7 +188,7 @@ fn test_failed_monotonic_advance_keeps_both_times() {
         // Neither time moved, and the clock still advances normally
         assert_eq!(clock.now(), now, "{backwards}");
         assert_eq!(clock.system_time(), wall, "{backwards}");
-        test.advance(Duration::from_secs(1));
+        tester.advance(Duration::from_secs(1));
         assert_eq!(clock.now(), now + Duration::from_secs(1), "{backwards}");
         assert_eq!(
             clock.system_time(),
@@ -202,8 +202,8 @@ fn test_failed_monotonic_advance_keeps_both_times() {
 #[test]
 fn test_failed_wall_advance_keeps_both_times() {
     // Keep a clock handle for checking both times at the wall-time limit
-    let mut test = TestClock::new();
-    let clock = test.clock();
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
 
     // Find the last representable wall time, which no advance can move past
     let last = last_system_time();
@@ -211,13 +211,13 @@ fn test_failed_wall_advance_keeps_both_times() {
     for absolute in [false, true] {
         // Set wall time to its limit, so either advance method overflows it
         let now = clock.now();
-        test.set_system_time(last);
+        tester.set_system_time(last);
         assert!(
             panic::catch_unwind(AssertUnwindSafe(|| {
                 if absolute {
-                    test.advance_to(now + Duration::from_secs(1));
+                    tester.advance_to(now + Duration::from_secs(1));
                 } else {
-                    test.advance(Duration::from_secs(1));
+                    tester.advance(Duration::from_secs(1));
                 }
             }))
             .is_err(),
@@ -227,8 +227,8 @@ fn test_failed_wall_advance_keeps_both_times() {
         // Neither time moved, and the clock advances normally once wall time is back in range
         assert_eq!(clock.now(), now, "{absolute}");
         assert_eq!(clock.system_time(), last, "{absolute}");
-        test.set_system_time(UNIX_EPOCH);
-        test.advance(Duration::from_secs(1));
+        tester.set_system_time(UNIX_EPOCH);
+        tester.advance(Duration::from_secs(1));
         assert_eq!(clock.now(), now + Duration::from_secs(1), "{absolute}");
         assert_eq!(
             clock.system_time(),
@@ -244,8 +244,8 @@ fn test_failed_wall_advance_keeps_both_times() {
 fn test_sleep_observes_advance_before_parking() {
     for until in [false, true] {
         // Start a sleeper that stops right after its deadline check, before it parks
-        let mut test = TestClock::new();
-        let clock = test.clock();
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
         let deadline = clock.now() + Duration::from_secs(60);
         let (checked, resume) = pause_before_park(&clock);
         let waiting = thread::spawn(move || {
@@ -259,7 +259,7 @@ fn test_sleep_observes_advance_before_parking() {
 
         // It is about to park without a real timer; advance to its deadline meanwhile
         assert_eq!(checked.recv().unwrap(), None, "{until}");
-        test.advance_to(deadline);
+        tester.advance_to(deadline);
 
         // Resumed, it must notice the advance instead of parking for good
         resume.send(()).unwrap();
@@ -273,8 +273,8 @@ fn test_sleep_observes_advance_before_parking() {
 fn test_sleep_reparks_after_partial_advance() {
     for until in [false, true] {
         // Start a sleeper and wait until it parks
-        let mut test = TestClock::new();
-        let clock = test.clock();
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
         let deadline = clock.now() + Duration::from_secs(5);
         let waiting = thread::spawn({
             let clock = clock.clone();
@@ -287,17 +287,17 @@ fn test_sleep_reparks_after_partial_advance() {
                 clock.now()
             }
         });
-        test.wait_blocked(1);
+        tester.wait_blocked(1);
 
         // Advance short of the deadline and catch the sleeper on its way back to park
         let (checked, resume) = pause_before_park(&clock);
-        test.advance(Duration::from_secs(2));
+        tester.advance(Duration::from_secs(2));
         assert_eq!(checked.recv().unwrap(), None, "{until}");
         resume.send(()).unwrap();
 
         // Parked again, it wakes only once the original deadline is reached
-        test.wait_blocked(1);
-        test.advance_to(deadline);
+        tester.wait_blocked(1);
+        tester.advance_to(deadline);
         assert_eq!(waiting.join().unwrap(), deadline, "{until}");
     }
 }
@@ -307,8 +307,8 @@ fn test_sleep_reparks_after_partial_advance() {
 #[test]
 fn test_advance_wakes_all_parked_sleepers() {
     // Park six sleepers on clones of one handle, half with each sleep method
-    let mut test = TestClock::new();
-    let clock = test.clock();
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
     let deadline = clock.now() + Duration::from_secs(60);
     let threads: Vec<_> = (0..6)
         .map(|index| {
@@ -323,11 +323,11 @@ fn test_advance_wakes_all_parked_sleepers() {
             })
         })
         .collect();
-    test.wait_blocked(6);
+    tester.wait_blocked(6);
     assert_eq!(blocked(&clock), 6);
 
     // One advance releases all of them at the shared deadline
-    test.advance(Duration::from_secs(60));
+    tester.advance(Duration::from_secs(60));
     for waiting in threads {
         assert_eq!(waiting.join().unwrap(), deadline);
     }
@@ -342,12 +342,12 @@ fn test_advance_wakes_all_parked_sleepers() {
 #[test]
 fn test_sleep_returns_for_reached_deadlines() {
     // Advance past a known instant, giving a deadline already in the past
-    let mut test = TestClock::new();
-    let start = test.clock().now();
-    test.advance(Duration::from_secs(1));
+    let mut tester = TestClock::new();
+    let start = tester.clock().now();
+    tester.advance(Duration::from_secs(1));
 
     // A past deadline, the current instant and a zero duration all return at once
-    for clock in [Clock::real(), test.clock()] {
+    for clock in [Clock::real(), tester.clock()] {
         clock.sleep_until(start);
         clock.sleep_until(clock.now());
         clock.sleep(Duration::ZERO);
@@ -358,30 +358,30 @@ fn test_sleep_returns_for_reached_deadlines() {
 #[test]
 fn test_wall_jumps_and_zero_advances_do_not_wake() {
     // Park a waiter three seconds ahead of its deadline and note its generation
-    let mut test = TestClock::new();
-    let clock = test.clock();
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
     let now = clock.now();
     let waiter = Arc::new(clock.waiter());
     let waiting = thread::spawn({
         let waiter = waiter.clone();
         move || waiter.wait_until(Some(now + Duration::from_secs(3)), || None::<()>)
     });
-    test.wait_blocked(1);
+    tester.wait_blocked(1);
     let seen = waiter.signal.generation();
 
     // Wall jumps and advances that leave monotonic time in place do not wake it
     for seconds in [100, 50] {
         let wall = UNIX_EPOCH + Duration::from_secs(seconds);
-        test.set_system_time(wall);
-        test.advance(Duration::ZERO);
-        test.advance_to(now);
+        tester.set_system_time(wall);
+        tester.advance(Duration::ZERO);
+        tester.advance_to(now);
         assert_eq!(clock.now(), now, "{seconds}");
         assert_eq!(clock.system_time(), wall, "{seconds}");
         assert_eq!(waiter.signal.generation(), seen, "{seconds}");
     }
 
     // A real advance still reaches it
-    test.advance(Duration::from_secs(3));
+    tester.advance(Duration::from_secs(3));
     assert_eq!(waiting.join().unwrap(), None);
 }
 
@@ -389,15 +389,15 @@ fn test_wall_jumps_and_zero_advances_do_not_wake() {
 #[test]
 fn test_spurious_wakeup_keeps_park_counted() {
     // Park a timed wait on a waiter the test can reach
-    let mut test = TestClock::new();
-    let clock = test.clock();
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
     let deadline = clock.now() + Duration::from_secs(1);
     let waiter = Arc::new(clock.waiter());
     let waiting = thread::spawn({
         let waiter = waiter.clone();
         move || waiter.wait_until(Some(deadline), || None::<()>)
     });
-    test.wait_blocked(1);
+    tester.wait_blocked(1);
 
     // Wake it through std alone, locking the signal so the wakeup reaches the wait
     let (checked, resume) = pause_before_rewait(&clock);
@@ -409,11 +409,11 @@ fn test_spurious_wakeup_keeps_park_counted() {
 
     // Caught between its two waits, the park still counts and lists its deadline
     assert_eq!(blocked(&clock), 1);
-    assert_eq!(test.next_deadline(), Some(deadline));
+    assert_eq!(tester.next_deadline(), Some(deadline));
     resume.send(()).unwrap();
 
     // Reaching the deadline still ends it
-    test.advance_to(deadline);
+    tester.advance_to(deadline);
     assert_eq!(waiting.join().unwrap(), None);
 }
 
@@ -421,8 +421,8 @@ fn test_spurious_wakeup_keeps_park_counted() {
 #[test]
 fn test_poisoned_clock_remains_usable() {
     // Record both times before the shared clock lock is poisoned
-    let mut test = TestClock::new();
-    let clock = test.clock();
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
     let now = clock.now();
     let wall = clock.system_time();
 
@@ -440,15 +440,15 @@ fn test_poisoned_clock_remains_usable() {
     // Reading and setting the times still work
     assert_eq!(clock.now(), now);
     assert_eq!(clock.system_time(), wall);
-    test.set_system_time(UNIX_EPOCH);
+    tester.set_system_time(UNIX_EPOCH);
 
     // So do parking, counting and advancing
     let waiting = thread::spawn({
         let clock = clock.clone();
         move || clock.sleep(Duration::from_secs(1))
     });
-    test.wait_blocked(1);
-    test.advance_to(now + Duration::from_secs(1));
+    tester.wait_blocked(1);
+    tester.advance_to(now + Duration::from_secs(1));
     waiting.join().unwrap();
     assert_eq!(clock.now(), now + Duration::from_secs(1));
     assert_eq!(clock.system_time(), UNIX_EPOCH + Duration::from_secs(1));
@@ -498,14 +498,14 @@ fn test_wait_observes_notification_during_check() {
 #[test]
 fn test_wait_observes_advance_during_check() {
     // Set a deadline that needs two advances from the ready callback
-    let mut test = TestClock::new();
-    let clock = test.clock();
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
     let waiter = clock.waiter();
     let deadline = clock.now() + Duration::from_secs(2);
 
     // Each check advances one second, so the wait must notice both advances to end
     let result = waiter.wait_until(Some(deadline), || {
-        test.advance(Duration::from_secs(1));
+        tester.advance(Duration::from_secs(1));
         None::<()>
     });
     assert_eq!(result, None);
@@ -516,8 +516,8 @@ fn test_wait_observes_advance_during_check() {
 #[test]
 fn test_ready_value_survives_advance() {
     // Park a waiter whose condition is a flag nobody notifies about
-    let mut test = TestClock::new();
-    let clock = test.clock();
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
     let waiter = Arc::new(clock.waiter());
     let deadline = clock.now() + Duration::from_secs(1);
     let ready = Arc::new(AtomicBool::new(false));
@@ -529,11 +529,11 @@ fn test_ready_value_survives_advance() {
             })
         }
     });
-    test.wait_blocked(1);
+    tester.wait_blocked(1);
 
     // Raise the flag silently, then wake the waiter by advancing past its deadline
     ready.store(true, Ordering::SeqCst);
-    test.advance(Duration::from_secs(1));
+    tester.advance(Duration::from_secs(1));
 
     // The woken waiter checks its condition before the deadline, so the value wins
     assert_eq!(waiting.join().unwrap(), Some(()));
@@ -570,8 +570,8 @@ fn test_notify_wakes_all_parked_waiters() {
 #[test]
 fn test_waiter_registry_tracks_live_waiters() {
     // Inspect registrations on the clock that owns the waiters
-    let test = TestClock::new();
-    let clock = test.clock();
+    let tester = TestClock::new();
+    let clock = tester.clock();
     let paused = clock.paused.as_ref().unwrap();
 
     // Keep three of 128 waiters, holding a dropped one's signal to show that a

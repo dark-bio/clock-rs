@@ -133,11 +133,11 @@ fn instant(origin: Instant, millis: i64) -> Instant {
 /// Runs a sequence and checks every operation against the public timer contract.
 fn check_operations(operations: &[Operation]) -> TestCaseResult {
     // Start beyond the origin so generated past deadlines never need a negative instant
-    let mut test = TestClock::new();
-    let clock = test.clock();
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
     let origin = clock.now();
-    test.set_system_time(UNIX_EPOCH);
-    test.advance(Duration::from_millis(8));
+    tester.set_system_time(UNIX_EPOCH);
+    tester.advance(Duration::from_millis(8));
     let mut model = Model {
         now: 8,
         wall: 8,
@@ -160,16 +160,16 @@ fn check_operations(operations: &[Operation]) -> TestCaseResult {
                 model.arm(offset.map(|offset| model.now + i64::from(offset)));
             }
             Operation::Advance(by) => {
-                test.advance(Duration::from_millis(by.into()));
+                tester.advance(Duration::from_millis(by.into()));
                 model.advance(by);
             }
             Operation::AdvanceTo(by) => {
-                test.advance_to(instant(origin, model.now + i64::from(by)));
+                tester.advance_to(instant(origin, model.now + i64::from(by)));
                 model.advance(by);
             }
             Operation::SetSystemTime(millis) => {
                 let duration = Duration::from_millis(millis.unsigned_abs().into());
-                test.set_system_time(if millis < 0 {
+                tester.set_system_time(if millis < 0 {
                     UNIX_EPOCH - duration
                 } else {
                     UNIX_EPOCH + duration
@@ -229,7 +229,7 @@ fn check_operations(operations: &[Operation]) -> TestCaseResult {
             .collect();
         let kept = model.timers.iter().filter(|timer| timer.delivered).count();
         let next = pending.iter().min().map(|&millis| instant(origin, millis));
-        prop_assert_eq!(test.next_deadline(), next, "{}: {:?}", step, operation);
+        prop_assert_eq!(tester.next_deadline(), next, "{}: {:?}", step, operation);
         prop_assert_eq!(
             clock.paused.as_ref().unwrap().timer_counts(),
             (pending.len(), kept),
