@@ -63,12 +63,17 @@ jobs:
       - run: cargo doc --all-features --no-deps --locked
 
   semver:
+    name: Semver on ${{ matrix.feature-group }}
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        feature-group: [ default-features, all-features ]
+
     steps:
       - uses: actions/checkout@v7
 
       - name: Check the public API against the published release
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
-          feature-group: all-features
+          feature-group: ${{ matrix.feature-group }}

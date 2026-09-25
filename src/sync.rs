@@ -157,7 +157,9 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
 
 /// Exclusive access to a mutex's value, which unlocks the mutex on drop.
 ///
-/// Like std's guard, it cannot be sent to another thread.
+/// Like std's guard, it cannot be sent to another thread. Sharing it between
+/// threads needs the value to be `Send` as well as `Sync`, one bound more than
+/// std's guard needs.
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
     /// The wrapped guard, which unlocks the mutex and poisons it on a panic.
@@ -214,6 +216,7 @@ pub struct Condvar {
 
 impl Condvar {
     /// Creates a condition variable whose deadlines are read from `clock`.
+    #[must_use]
     pub fn new(clock: &Clock) -> Self {
         Self {
             waiter: clock.waiter(),
@@ -340,6 +343,7 @@ pub struct WaitTimeoutResult(
 
 impl WaitTimeoutResult {
     /// Returns whether the deadline ended the wait before it saw a notification.
+    #[must_use]
     pub fn timed_out(&self) -> bool {
         self.0
     }

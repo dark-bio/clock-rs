@@ -29,4 +29,4 @@ lint:
 # by another toolchain would get merged into the report as uncovered code.
 coverage:
 	rm -rf target/llvm-cov-target
-	cargo +nightly llvm-cov --html --open
+	cargo +nightly llvm-cov --all-features --html --open

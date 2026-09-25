@@ -54,7 +54,11 @@ const MAX_REAL_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 ///
 /// Clones share one clock. Equality compares identity, so all real clocks are
 /// equal and a test clock equals only the handles of its own `TestClock`.
+///
+/// It cannot be built from a struct literal and it has a destructor in every
+/// build, so code that compiles without `test-clock` compiles with it too.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct Clock {
     /// Shared state of a test clock, or nothing for the real clock.
     #[cfg(any(test, feature = "test-clock"))]
@@ -71,6 +75,7 @@ impl Clock {
     }
 
     /// Returns the clock's current monotonic time.
+    #[must_use]
     pub fn now(&self) -> Instant {
         #[cfg(any(test, feature = "test-clock"))]
         if let Some(paused) = &self.paused {
@@ -80,11 +85,13 @@ impl Clock {
     }
 
     /// Returns the time since `since`, or zero if it is later than now.
+    #[must_use]
     pub fn elapsed(&self, since: Instant) -> Duration {
         self.now().saturating_duration_since(since)
     }
 
     /// Returns the clock's current wall time.
+    #[must_use]
     pub fn system_time(&self) -> SystemTime {
         #[cfg(any(test, feature = "test-clock"))]
         if let Some(paused) = &self.paused {
@@ -161,6 +168,16 @@ impl Clock {
 #[cfg(not(any(test, feature = "test-clock")))]
 const _: () = assert!(size_of::<Clock>() == 0);
 
+// A production clock still has a destructor, as a test build's does
+#[cfg(not(any(test, feature = "test-clock")))]
+const _: () = assert!(std::mem::needs_drop::<Clock>());
+
+impl Drop for Clock {
+    /// Does nothing, but gives every build a destructor, so enabling
+    /// `test-clock` does not change which const contexts accept a clock.
+    fn drop(&mut self) {}
+}
+
 impl PartialEq for Clock {
     /// Compares identity, with all real clocks equal to each other.
     fn eq(&self, other: &Self) -> bool {
@@ -173,13 +190,18 @@ impl Eq for Clock {}
 impl fmt::Debug for Clock {
     /// Shows whether the clock is paused, its advance and its wall time.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Read both times under one lock before calling the formatter's writer
+        #[cfg(any(test, feature = "test-clock"))]
+        let snapshot = self.paused.as_ref().map(|paused| paused.snapshot());
+
+        // Format without the clock lock, since the writer may read this clock
         let mut clock = f.debug_struct("Clock");
         #[cfg(any(test, feature = "test-clock"))]
-        if let Some(paused) = &self.paused {
+        if let Some((advanced, system_time)) = snapshot {
             return clock
                 .field("paused", &true)
-                .field("advanced", &paused.advanced())
-                .field("system_time", &paused.system_time())
+                .field("advanced", &advanced)
+                .field("system_time", &system_time)
                 .finish();
         }
         clock.field("paused", &false).finish()
@@ -321,15 +343,6 @@ impl Drop for Waiter {
         if let Some(paused) = &self.clock.paused {
             paused.unregister(&self.signal);
         }
-    }
-}
-
-impl fmt::Debug for Waiter {
-    /// Shows the clock, never the wakeup bookkeeping.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Waiter")
-            .field("clock", &self.clock)
-            .finish_non_exhaustive()
     }
 }
 
