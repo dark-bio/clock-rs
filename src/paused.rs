@@ -6,12 +6,13 @@
 
 //! Test clocks, which move only when their owner advances them.
 
+use crate::primitives::{Condvar, Mutex, MutexGuard};
 use crate::{Clock, Signal};
 #[cfg(feature = "crossbeam")]
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Owns a clock that moves only when advanced, for tests.
@@ -45,13 +46,13 @@ impl TestClock {
                 }),
                 changed: Condvar::new(),
                 #[cfg(test)]
-                before_park: Mutex::new(None),
+                before_park: std::sync::Mutex::new(None),
                 #[cfg(test)]
-                before_rewait: Mutex::new(None),
+                before_rewait: std::sync::Mutex::new(None),
                 #[cfg(all(test, feature = "crossbeam"))]
-                after_timer_send: Mutex::new(None),
+                after_timer_send: std::sync::Mutex::new(None),
                 #[cfg(all(test, feature = "crossbeam"))]
-                after_timer_receive: Mutex::new(None),
+                after_timer_receive: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -250,18 +251,18 @@ pub(crate) struct Paused {
     /// One-shot test hook, run before a park's first wait with no clock or
     /// signal lock held.
     #[cfg(test)]
-    pub(crate) before_park: Mutex<Option<BeforePark>>,
+    pub(crate) before_park: std::sync::Mutex<Option<BeforePark>>,
     /// One-shot test hook, run like `before_park` before a park waits again
     /// after a spurious wakeup.
     #[cfg(test)]
-    pub(crate) before_rewait: Mutex<Option<BeforePark>>,
+    pub(crate) before_rewait: std::sync::Mutex<Option<BeforePark>>,
     /// One-shot test hook, run after a timer's send with no crate lock held.
     #[cfg(all(test, feature = "crossbeam"))]
-    after_timer_send: Mutex<Option<TimerHook>>,
+    after_timer_send: std::sync::Mutex<Option<TimerHook>>,
     /// One-shot test hook, run when a receive's timer wins, before the receiver
     /// is checked again.
     #[cfg(all(test, feature = "crossbeam"))]
-    after_timer_receive: Mutex<Option<TimerHook>>,
+    after_timer_receive: std::sync::Mutex<Option<TimerHook>>,
 }
 
 /// Mutable part of a test clock.
@@ -287,6 +288,13 @@ pub(crate) struct PausedState {
 }
 
 impl Paused {
+    /// Returns armed timers and retained senders for the bookkeeping model.
+    #[cfg(all(test, feature = "crossbeam", not(loom)))]
+    pub(crate) fn timer_counts(&self) -> (usize, usize) {
+        let state = self.lock();
+        (state.timers.len(), state.fired.len())
+    }
+
     /// Arms a public timer, whose channel stays connected after delivery.
     #[cfg(feature = "crossbeam")]
     pub(crate) fn at(&self, deadline: Instant) -> Receiver<Instant> {
@@ -528,7 +536,7 @@ pub(crate) type BeforePark = Box<dyn FnOnce(Option<Instant>) + Send>;
 type TimerHook = Box<dyn FnOnce() + Send>;
 
 /// Checks timer delivery, retention and receive precedence without real deadlines.
-#[cfg(all(test, feature = "crossbeam"))]
+#[cfg(all(test, feature = "crossbeam", not(loom)))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod timer_tests {
     use super::*;

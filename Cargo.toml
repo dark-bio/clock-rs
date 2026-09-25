@@ -17,7 +17,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)", "cfg(loom)"] }
 
 [features]
 default = []
@@ -26,3 +26,9 @@ crossbeam = ["dep:crossbeam-channel"]
 
 [dependencies]
 crossbeam-channel = { version = "0.5.17", optional = true }
+
+[dev-dependencies]
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7.2"
