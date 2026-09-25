@@ -75,9 +75,11 @@ The `crossbeam` feature adds timers that crossbeam-channel's `select!` can wait 
 
 On a test clock, `at(deadline)` returns a capacity-1 channel. The clock sends the deadline into it once an advance reaches it, or at once when it is already due. The message is the deadline itself, even after an advance that overshoots it, as crossbeam's is. `after(duration)` takes its deadline from the clock when called, and a duration past the end of `Instant`'s range returns a receiver that never fires.
 
-crossbeam's timers never disconnect, but a crossbeam sender cannot tell that its receiver dropped. So a test clock keeps the sender of every delivered timer while the clock lives, and a consumed timer stays connected and empty, as crossbeam's does. The cost is test-only. Memory grows with the timers a test clock delivers, and a timer whose receiver was dropped still counts in `wait_timers` and `next_deadline` until it fires.
+An advance delivers every timer due by its target before any thread can read the new time from the clock. It still sends them one at a time, and a waiting `select!` takes the first one sent. So a `select_biased!` over timers due at the same instant can take a later arm than it would on the real clock, where they become ready together.
 
-`recv_timeout` and `recv_deadline` keep crossbeam's precedence, where a buffered message or a disconnection wins over the timeout. They are clock methods, because a receiver's own methods of the same names would shadow an extension trait's. On a test clock, a waiting receive arms a timer that `wait_timers` counts until it fires or the receive returns.
+A test clock's timers stay connected until the `TestClock` and every `Clock` handle are gone, so a consumed timer stays connected and empty, as crossbeam's does. The cost is test-only. Memory grows with the timers a test clock delivers, and a timer whose receiver was dropped still counts in `wait_timers` and `next_deadline` until it fires.
+
+`recv_timeout` and `recv_deadline` keep crossbeam's precedence, where a buffered message or a disconnection wins over the timeout. On a test clock, a clock timer due by the receive's deadline holds its message before the receive can time out, so it wins too. They are clock methods, because a receiver's own methods of the same names would shadow an extension trait's. On a test clock, a waiting receive arms a timer that `wait_timers` counts until it fires or the receive returns.
 
 ## Testing on a test clock
 
@@ -87,7 +89,7 @@ A test clock starts at the real monotonic and wall times. `advance` and `advance
 
 An advance jumps straight to its target. Where every period matters, advance one period and wait for its effect before the next. A test clock never moves by itself, so a deadline nobody advances to never passes, and such tests belong under a runner that stops hung tests.
 
-Dropping the `TestClock` stops all advances. Its parked sleeps then never end, its condvar waits end only when notified, and its unfired timers never fire, so advance past their deadlines before dropping it.
+Dropping the `TestClock` stops all advances. Its parked sleeps then never end, its condvar waits end only when notified, and its unfired timers never fire while a `Clock` handle lives. Once the last handle is gone too, those timers disconnect, and a `select!` on one sees that arm ready with an error. So advance past their deadlines before dropping the `TestClock`.
 
 ### Waiting for threads
 

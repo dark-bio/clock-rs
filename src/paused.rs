@@ -53,8 +53,6 @@ impl TestClock {
                 #[cfg(test)]
                 before_rewait: std::sync::Mutex::new(None),
                 #[cfg(all(test, feature = "crossbeam"))]
-                after_timer_send: std::sync::Mutex::new(None),
-                #[cfg(all(test, feature = "crossbeam"))]
                 after_timer_receive: std::sync::Mutex::new(None),
             }),
         }
@@ -170,7 +168,8 @@ impl TestClock {
         deadline
     }
 
-    /// Validates both new times before updating state and notifying waiters.
+    /// Validates both new times, publishes them together with the due timers'
+    /// messages, then wakes the reached waits.
     fn advance_with(&mut self, next: impl FnOnce(Instant) -> Instant) {
         // Check the new times before taking the lock, so a failed check panics with
         // no lock held. Only the owner advances, so nothing changes them in between.
@@ -203,27 +202,20 @@ impl TestClock {
             })
             .collect();
 
-        // Take the due timers in the same lock hold
+        // Deliver every due timer before another thread can read the new time
         #[cfg(feature = "crossbeam")]
-        let timers = {
-            let mut timers = Vec::new();
+        {
             while state
                 .timers
                 .first_key_value()
                 .is_some_and(|(&(deadline, _), _)| deadline <= next)
             {
-                timers.push(state.timers.pop_first().expect("due timer exists").1);
+                let timer = state.timers.pop_first().expect("due timer exists").1;
+                state.fire(&timer);
             }
             self.paused.changed.notify_all();
-            timers
-        };
-        drop(state);
-
-        // Deliver in deadline order with the new times visible and no lock held
-        #[cfg(feature = "crossbeam")]
-        for timer in timers {
-            self.paused.fire(&timer);
         }
+        drop(state);
 
         // Wake outside the clock lock, since parking takes the signal lock first
         for signal in signals {
@@ -279,11 +271,8 @@ pub(crate) struct Paused {
     /// after a spurious wakeup.
     #[cfg(test)]
     pub(crate) before_rewait: std::sync::Mutex<Option<BeforePark>>,
-    /// One-shot test hook, run after a timer's send with no crate lock held.
-    #[cfg(all(test, feature = "crossbeam"))]
-    after_timer_send: std::sync::Mutex<Option<TimerHook>>,
     /// One-shot test hook, run when a receive's timer wins, before the receiver
-    /// is checked again.
+    /// is checked again, with no crate lock held.
     #[cfg(all(test, feature = "crossbeam"))]
     after_timer_receive: std::sync::Mutex<Option<TimerHook>>,
 }
@@ -318,6 +307,41 @@ impl PausedState {
             .at(self.now)
             .expect("wall time fits, since every change checks it first")
     }
+
+    /// Lists a timer until an advance reaches it, or delivers it at once if it
+    /// is already due.
+    #[cfg(feature = "crossbeam")]
+    fn arm_timer(&mut self, deadline: Instant, retain: bool) -> (Arc<Timer>, Receiver<Instant>) {
+        // Give the timer a stable address and room for its only message
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let timer = Arc::new(Timer {
+            deadline,
+            sender,
+            retain,
+        });
+
+        // List or deliver it in the lock hold that read the time, so no advance slips between
+        if deadline > self.now {
+            self.timers.insert(timer.key(), timer.clone());
+        } else {
+            self.fire(&timer);
+        }
+        (timer, receiver)
+    }
+
+    /// Sends a timer's deadline, and keeps the sender of a delivered public timer.
+    #[cfg(feature = "crossbeam")]
+    fn fire(&mut self, timer: &Timer) {
+        // The capacity-1 channel has never been sent to, so this cannot block
+        let delivered = timer.sender.send(timer.deadline).is_ok();
+
+        // Keep a delivered public timer's sender, so its channel stays connected like
+        // crossbeam's. Nothing reports a dropped receiver without sending, and a second
+        // send would refill a consumed timer.
+        if delivered && timer.retain {
+            self.fired.push(timer.sender.clone());
+        }
+    }
 }
 
 /// A wall time and the monotonic instant it was set at.
@@ -350,29 +374,50 @@ impl Paused {
     /// Arms a public timer, whose channel stays connected after delivery.
     #[cfg(feature = "crossbeam")]
     pub(crate) fn at(&self, deadline: Instant) -> Receiver<Instant> {
-        self.arm_timer(deadline, true).1
+        let mut state = self.lock();
+        let (_, receiver) = state.arm_timer(deadline, true);
+        self.changed.notify_all();
+        receiver
     }
 
     /// Receives until the clock reaches `deadline`, where a message or a
     /// disconnection wins over expiry, as in crossbeam.
+    ///
+    /// The receiver is never checked under the clock lock, since a rendezvous
+    /// receive can wait on a sender that reads the clock. Expiry is decided only
+    /// at a time no advance changed since the check, and an advance delivers its
+    /// due timers before anyone reads its time, so a timer due by the deadline
+    /// holds its message by then.
     #[cfg(feature = "crossbeam")]
     pub(crate) fn recv_deadline<T>(
         &self,
         receiver: &Receiver<T>,
         deadline: Instant,
     ) -> Result<T, RecvTimeoutError> {
-        // Prefer a ready receiver even when the deadline has already passed
-        match receiver.try_recv() {
-            Ok(value) => return Ok(value),
-            Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
-            Err(TryRecvError::Empty) => {}
-        }
-        if self.now() >= deadline {
-            return Err(RecvTimeoutError::Timeout);
-        }
+        // Check the receiver at a known time, and look again if an advance ran meanwhile
+        let (timer, timeout) = loop {
+            let seen = self.now();
+            match receiver.try_recv() {
+                Ok(value) => return Ok(value),
+                Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
+                Err(TryRecvError::Empty) => {}
+            }
+            let mut state = self.lock();
+            if state.now != seen {
+                continue;
+            }
 
-        // Arm before selecting, and disarm on every return from the adapter
-        let (timer, timeout) = self.arm_timer(deadline, false);
+            // Decide expiry at the checked time, or list the timeout before unlocking so
+            // that no advance slips between and wait_timers counts it
+            if seen >= deadline {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            let timer = state.arm_timer(deadline, false);
+            self.changed.notify_all();
+            break timer;
+        };
+
+        // Unlist the timeout on every return from the adapter
         let _registration = ReceiveTimer {
             paused: self,
             timer,
@@ -391,58 +436,14 @@ impl Paused {
                     }
                 }
 
-                // Check the receiver again, since select picks randomly among ready arms
+                // Wait out an advance still delivering, then recheck without the lock, since
+                // select may pick the timeout before a message due at the same time
+                drop(self.lock());
                 receiver.try_recv().map_err(|err| match err {
                     TryRecvError::Empty => RecvTimeoutError::Timeout,
                     TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
                 })
             }
-        }
-    }
-
-    /// Registers an unfired timer or delivers it immediately if already due.
-    #[cfg(feature = "crossbeam")]
-    fn arm_timer(&self, deadline: Instant, retain: bool) -> (Arc<Timer>, Receiver<Instant>) {
-        // Give the timer a stable address and room for its only message
-        let (sender, receiver) = crossbeam_channel::bounded(1);
-        let timer = Arc::new(Timer {
-            deadline,
-            sender,
-            retain,
-        });
-
-        // Check and register under one lock so an advance cannot miss this timer
-        let mut state = self.lock();
-        if deadline > state.now {
-            state.timers.insert(timer.key(), timer.clone());
-            self.changed.notify_all();
-            drop(state);
-        } else {
-            drop(state);
-            self.fire(&timer);
-        }
-        (timer, receiver)
-    }
-
-    /// Sends a timer's deadline with no clock lock held, and keeps the sender of
-    /// a delivered public timer.
-    #[cfg(feature = "crossbeam")]
-    fn fire(&self, timer: &Timer) {
-        // The capacity-1 channel has never been sent to, so this cannot block
-        let delivered = timer.sender.send(timer.deadline).is_ok();
-
-        // Let tests observe publication and delivery order before the next send
-        #[cfg(test)]
-        {
-            let hook = self.after_timer_send.lock().unwrap().take();
-            if let Some(hook) = hook {
-                hook();
-            }
-        }
-
-        // Failed deliveries and adapter timers keep no sender in the clock
-        if delivered && timer.retain {
-            self.lock().fired.push(timer.sender.clone());
         }
     }
 
@@ -525,7 +526,7 @@ impl Paused {
 struct Timer {
     /// Deadline sent as the message, even when an advance overshoots it.
     deadline: Instant,
-    /// Sender of the timer's capacity-1 channel.
+    /// Sender of the capacity-1 channel, sent to only once under the clock lock.
     sender: Sender<Instant>,
     /// Whether the clock keeps the sender after delivery, as for public timers.
     retain: bool,

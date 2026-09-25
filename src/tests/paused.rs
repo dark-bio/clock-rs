@@ -8,7 +8,8 @@
 
 use super::*;
 use crate::tests::helpers::{blocked, signals, wakes};
-use crossbeam_channel::{bounded, select};
+use crossbeam_channel::{Select, bounded, select};
+use std::sync::mpsc;
 use std::thread;
 use std::time::UNIX_EPOCH;
 
@@ -36,9 +37,10 @@ fn test_at_fires_at_exact_deadline() {
     assert_eq!(tester.next_deadline(), None);
 }
 
-// One advance publishes both times before sending every due timer in deadline order.
+// One advance delivers every due timer its own deadline, keeping only the
+// senders of delivered public timers.
 #[test]
-fn test_advance_publishes_time_and_fires_all_due_timers_in_order() {
+fn test_advance_delivers_all_due_timers() {
     // Arm timers out of order, with two equal deadlines and one dropped receiver
     let mut tester = TestClock::new();
     let clock = tester.clock();
@@ -51,22 +53,11 @@ fn test_advance_publishes_time_and_fires_all_due_timers_in_order() {
     let future = clock.at(start + Duration::from_secs(7));
     tester.wait_timers(5);
 
-    // Inspect the very first send before the advance can send anything else
-    let target = start + Duration::from_secs(5);
-    *tester.paused.after_timer_send.lock().unwrap() = Some(Box::new({
-        let clock = clock.clone();
-        let (first, late, equal) = (first.clone(), late.clone(), equal.clone());
-        move || {
-            assert_eq!(clock.now(), target);
-            assert_eq!(clock.system_time(), UNIX_EPOCH + Duration::from_secs(5));
-            assert_eq!(first.len(), 1);
-            assert_eq!(late.try_recv(), Err(TryRecvError::Empty));
-            assert_eq!(equal.try_recv(), Err(TryRecvError::Empty));
-        }
-    }));
-
     // An overshoot sends the deadlines themselves, keeping only delivered senders
+    let target = start + Duration::from_secs(5);
     tester.advance_to(target);
+    assert_eq!(clock.now(), target);
+    assert_eq!(clock.system_time(), UNIX_EPOCH + Duration::from_secs(5));
     assert_eq!(first.try_recv(), Ok(start + Duration::from_secs(1)));
     assert_eq!(late.try_recv(), Ok(start + Duration::from_secs(3)));
     assert_eq!(equal.try_recv(), Ok(start + Duration::from_secs(3)));
@@ -363,6 +354,103 @@ fn test_receive_checks_channel_before_reached_deadline() {
     }
 }
 
+// A receive whose deadline equals a clock timer's gets the timer's message,
+// not a timeout.
+#[test]
+fn test_receive_gets_timer_at_equal_deadline() {
+    for relative in [false, true] {
+        // Receive from a clock timer, with the receive's deadline equal to the timer's
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
+        let duration = Duration::from_secs(5);
+        let deadline = clock.now() + duration;
+        let timer = clock.at(deadline);
+        let waiting = thread::spawn(move || {
+            if relative {
+                clock.recv_timeout(&timer, duration)
+            } else {
+                clock.recv_deadline(&timer, deadline)
+            }
+        });
+        tester.wait_timers(2);
+
+        // One advance reaches both, and the message wins
+        tester.advance_to(deadline);
+        assert_eq!(waiting.join().unwrap(), Ok(deadline), "{relative}");
+    }
+}
+
+// A receive takes a rendezvous message whose sender reads the clock only once
+// the receive pairs with it, without deadlocking on the clock.
+#[test]
+fn test_receive_takes_rendezvous_message_that_reads_the_clock() {
+    for relative in [false, true] {
+        // Park a select whose send arm reads the clock only when chosen, and wait until it waits
+        let tester = TestClock::new();
+        let clock = tester.clock();
+        let (sender, receiver) = bounded(0);
+        let sending = thread::spawn({
+            let clock = clock.clone();
+            move || {
+                select! {
+                    send(sender, clock.now()) -> result => result.unwrap(),
+                    recv(crossbeam_channel::never::<()>()) -> _ => unreachable!(),
+                }
+            }
+        });
+        let mut ready = Select::new();
+        ready.recv(&receiver);
+        ready.ready();
+
+        // The receive pairs with it and gets the time it read
+        let received = if relative {
+            clock.recv_timeout(&receiver, Duration::from_secs(5))
+        } else {
+            clock.recv_deadline(&receiver, clock.now() + Duration::from_secs(5))
+        };
+        assert_eq!(received, Ok(clock.now()), "{relative}");
+        sending.join().unwrap();
+    }
+}
+
+// A receive whose timeout wins still takes a rendezvous message whose sender
+// reads the clock, without deadlocking on the clock during its recheck.
+#[test]
+fn test_receive_recheck_takes_rendezvous_message_that_reads_the_clock() {
+    // Once the receive's timer wins, park a select whose send arm reads the clock only
+    // when chosen, and let the receive recheck only after it waits
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
+    let deadline = clock.now() + Duration::from_secs(5);
+    let (sender, receiver) = bounded(0);
+    let (started, sendings) = mpsc::channel();
+    *tester.paused.after_timer_receive.lock().unwrap() = Some(Box::new({
+        let (clock, receiver) = (clock.clone(), receiver.clone());
+        move || {
+            let sending = thread::spawn(move || {
+                select! {
+                    send(sender, clock.now()) -> result => result.unwrap(),
+                    recv(crossbeam_channel::never::<()>()) -> _ => unreachable!(),
+                }
+            });
+            let mut ready = Select::new();
+            ready.recv(&receiver);
+            ready.ready();
+            started.send(sending).unwrap();
+        }
+    }));
+    let waiting = thread::spawn({
+        let clock = clock.clone();
+        move || clock.recv_deadline(&receiver, deadline)
+    });
+    tester.wait_timers(1);
+
+    // The timeout wins at the deadline, and the recheck gets the parked sender's time
+    tester.advance_to(deadline);
+    assert_eq!(waiting.join().unwrap(), Ok(deadline));
+    sendings.recv().unwrap().join().unwrap();
+}
+
 // Empty connected channels time out at reached deadlines without registering timers.
 #[test]
 fn test_receive_reached_deadline_times_out_without_timer() {
@@ -548,6 +636,14 @@ fn test_receive_timeout_overflow_waits_without_timer() {
         assert!(clock.now().checked_add(Duration::MAX).is_none());
         let (sender, receiver) = bounded(0);
         let waiting = thread::spawn(move || clock.recv_timeout(&receiver, Duration::MAX));
+
+        // Wait until the receive blocks, without offering it a message, and check it armed no timer
+        let mut select = Select::new();
+        let send = select.send(&sender);
+        assert_eq!(select.ready(), send, "{disconnect}");
+        drop(select);
+        assert!(tester.paused.lock().timers.is_empty(), "{disconnect}");
+        assert_eq!(tester.next_deadline(), None, "{disconnect}");
 
         // An advance leaves it waiting, and only its channel ends it
         tester.advance(Duration::from_secs(60));
