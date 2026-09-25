@@ -10,6 +10,7 @@ keywords = ["clock", "time", "testing", "virtual-time", "dark-bio"]
 license = "BSD-3-Clause"
 edition = "2024"
 rust-version = "1.85"
+exclude = ["lint/"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -21,3 +22,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
 [features]
 default = []
 test-clock = []
+crossbeam = ["dep:crossbeam-channel"]
+
+[dependencies]
+crossbeam-channel = { version = "0.5.17", optional = true }

@@ -15,6 +15,15 @@
 
 pub mod sync;
 
+#[cfg(feature = "crossbeam")]
+mod timers;
+
+/// The crossbeam-channel crate that the clock's timers use, for naming its
+/// types at the same version.
+#[cfg(feature = "crossbeam")]
+#[cfg_attr(docsrs, doc(cfg(feature = "crossbeam")))]
+pub use crossbeam_channel;
+
 // Test clocks exist only in tests, so a build without the test-clock feature
 // cannot stop its own time
 #[cfg(any(test, feature = "test-clock"))]
@@ -121,6 +130,10 @@ impl Clock {
         }
     }
 }
+
+// A production clock carries no state, so passing one around costs nothing
+#[cfg(not(any(test, feature = "test-clock")))]
+const _: () = assert!(size_of::<Clock>() == 0);
 
 impl PartialEq for Clock {
     /// Compares identity, with all real clocks equal to each other.
@@ -405,7 +418,7 @@ mod tests {
     }
 
     /// Finds the platform's last whole wall-clock second through std's checked arithmetic.
-    fn last_system_time() -> SystemTime {
+    pub(crate) fn last_system_time() -> SystemTime {
         // Add every power of two that still fits, from the largest down
         let mut time = UNIX_EPOCH;
         for bit in (0..64).rev() {
@@ -481,6 +494,8 @@ mod tests {
 
         // Format a test clock into a writer that reads the same clock on every write
         let test = TestClock::new();
+        #[cfg(feature = "crossbeam")]
+        let _timer = test.clock().after(Duration::from_secs(5));
         let mut writer = ClockWriter {
             clock: test.clock(),
             output: String::new(),
@@ -491,6 +506,8 @@ mod tests {
         for field in ["advanced:", "system_time:", "blocked:"] {
             assert!(writer.output.contains(field), "{field}");
         }
+        #[cfg(feature = "crossbeam")]
+        assert!(writer.output.contains("timers: 1"));
     }
 
     // Elapsed time follows advances and saturates at zero for future instants.
