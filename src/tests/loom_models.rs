@@ -308,3 +308,121 @@ fn test_notify_all_races_advance_with_mixed_waiters() {
         assert_idle(&tester, &clock);
     });
 }
+
+// A partial advance never ends a sleep, whether it lands before or after the
+// sleep registers, and the parked sleep stays listed at its own deadline.
+#[test]
+fn test_partial_advance_leaves_sleep_listed() {
+    loom::model(|| {
+        // Start a sleeper without ordering its registration against a partial advance
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
+        let deadline = clock.now() + Duration::from_secs(2);
+        let sleeper = thread::spawn({
+            let clock = clock.clone();
+            move || {
+                clock.sleep_until(deadline);
+                assert_eq!(clock.now(), deadline);
+            }
+        });
+        tester.advance(Duration::from_secs(1));
+
+        // Once parked, the sleep is listed at its deadline, and only reaching it ends it
+        tester.wait_blocked(1);
+        assert_eq!(tester.next_deadline(), Some(deadline));
+        tester.advance_to(deadline);
+        sleeper.join().unwrap();
+        assert_idle(&tester, &clock);
+    });
+}
+
+// Reaching one deadline wait on a condvar keeps a later wait on the same condvar
+// parked and listed, however the waits' registrations race the advance.
+#[test]
+fn test_reached_wait_keeps_later_wait_on_condvar_listed() {
+    loom::model(|| {
+        // Start an earlier and a later deadline wait on one condvar, racing the first advance
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
+        let earlier = clock.now() + Duration::from_secs(1);
+        let later = clock.now() + Duration::from_secs(2);
+        let pair = Arc::new((Mutex::new(()), Condvar::new(&clock)));
+        let waits: Vec<_> = [earlier, later]
+            .into_iter()
+            .map(|deadline| {
+                let pair = pair.clone();
+                thread::spawn(move || {
+                    let (_guard, result) = pair
+                        .1
+                        .wait_deadline(pair.0.lock().unwrap(), deadline)
+                        .unwrap();
+                    assert!(result.timed_out());
+                })
+            })
+            .collect();
+        let mut waits = waits.into_iter();
+
+        // Reaching the earlier deadline ends that wait, and the later one parks listed
+        tester.advance_to(earlier);
+        waits.next().unwrap().join().unwrap();
+        tester.wait_blocked(1);
+        assert_eq!(tester.next_deadline(), Some(later));
+
+        // Reaching the later deadline ends it too
+        tester.advance_to(later);
+        waits.next().unwrap().join().unwrap();
+        drop(pair);
+        assert_idle(&tester, &clock);
+    });
+}
+
+// A broadcast racing a reached deadline releases a still-parked untimed wait.
+#[test]
+fn test_notification_survives_advance_with_mixed_waiters() {
+    loom::model(|| {
+        // Park a timed and an untimed wait on one condvar before either wake can arrive
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
+        let deadline = clock.now() + Duration::from_secs(1);
+        let pair = Arc::new((Mutex::new(false), Condvar::new(&clock)));
+        let timed = thread::spawn({
+            let (pair, clock) = (pair.clone(), clock.clone());
+            move || {
+                let (ready, result) = pair
+                    .1
+                    .wait_deadline(pair.0.lock().unwrap(), deadline)
+                    .unwrap();
+                if result.timed_out() {
+                    assert_eq!(clock.now(), deadline);
+                } else {
+                    assert!(*ready);
+                }
+            }
+        });
+        let untimed = thread::spawn({
+            let pair = pair.clone();
+            move || {
+                let ready = pair.1.wait_while(pair.0.lock().unwrap(), |ready| !*ready);
+                assert!(*ready.unwrap());
+            }
+        });
+        tester.wait_blocked(2);
+
+        // Race the first notification with the advance while both waits still count
+        let notifying = thread::spawn({
+            let pair = pair.clone();
+            move || {
+                *pair.0.lock().unwrap() = true;
+                pair.1.notify_all();
+            }
+        });
+        tester.advance_to(deadline);
+
+        // The untimed wait must observe the notification without a second broadcast
+        notifying.join().unwrap();
+        timed.join().unwrap();
+        untimed.join().unwrap();
+        drop(pair);
+        assert_idle(&tester, &clock);
+    });
+}
