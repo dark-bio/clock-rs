@@ -10,6 +10,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  loom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # Stops a model whose schedules grow beyond the budget
+    steps:
+      - uses: actions/checkout@v7
+      - run: make loom
+
   test:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

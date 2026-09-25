@@ -87,7 +87,7 @@ impl Clock {
 }
 
 /// Checks the real clock's timers and receives against crossbeam's, without waiting.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;

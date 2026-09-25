@@ -10,10 +10,21 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // Allow excluding test code from coverage measurements on nightly
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
-// The crate only builds on std's safe synchronization and never needs unsafe
+// The crate only builds on safe synchronization and never needs unsafe
 #![forbid(unsafe_code)]
 
 pub mod sync;
+
+// Every internal lock comes from here, so loom can swap in its own when model
+// checking the waits
+mod primitives;
+
+// Loom checks the wait core under every schedule, and proptest checks the timer
+// bookkeeping against a reference model
+#[cfg(all(test, loom))]
+mod loom_tests;
+#[cfg(all(test, feature = "crossbeam", not(loom)))]
+mod timer_model;
 
 #[cfg(feature = "crossbeam")]
 mod timers;
@@ -35,8 +46,10 @@ pub use paused::TestClock;
 use paused::TestClock;
 
 use std::fmt;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+
+use primitives::{Condvar, Mutex, MutexGuard};
 
 /// A clock that reads real time, or a test's time that moves only on command.
 ///
@@ -366,7 +379,7 @@ impl Signal {
 }
 
 /// Checks clock control, sleep races and the internal eventcount contract.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;

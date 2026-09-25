@@ -9,25 +9,35 @@
 //! Both mirror std's. A condvar takes its clock when created and waits on this
 //! module's mutex, which otherwise works like std's.
 
-use crate::{Clock, Waiter};
+use crate::{Clock, Waiter, primitives};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::sync::{self, LockResult, PoisonError, TryLockError, TryLockResult};
+use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};
 use std::time::Instant;
 
 /// A mutual exclusion lock that this module's condvars can wait on.
 ///
 /// It wraps std's mutex, keeping its locking and poisoning.
 pub struct Mutex<T: ?Sized> {
-    /// The wrapped std mutex, which holds the value.
-    inner: sync::Mutex<T>,
+    /// The wrapped std mutex, or loom's under model checking, which holds the value.
+    inner: primitives::Mutex<T>,
 }
 
 impl<T> Mutex<T> {
     /// Creates an unlocked mutex holding `value`.
+    #[cfg(not(all(test, loom)))]
     pub const fn new(value: T) -> Self {
         Self {
-            inner: sync::Mutex::new(value),
+            inner: primitives::Mutex::new(value),
+        }
+    }
+
+    /// Creates an unlocked mutex holding `value`, without the `const` that
+    /// loom's mutex cannot offer.
+    #[cfg(all(test, loom))]
+    pub fn new(value: T) -> Self {
+        Self {
+            inner: primitives::Mutex::new(value),
         }
     }
 
@@ -71,11 +81,13 @@ impl<T: ?Sized> Mutex<T> {
     }
 
     /// Reports whether a thread panicked while holding the mutex.
+    #[cfg(not(all(test, loom)))]
     pub fn is_poisoned(&self) -> bool {
         self.inner.is_poisoned()
     }
 
     /// Clears the poisoned state, marking the value as recovered.
+    #[cfg(not(all(test, loom)))]
     pub fn clear_poison(&self) {
         self.inner.clear_poison();
     }
@@ -115,8 +127,8 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
 /// Like std's guard, it cannot be sent to another thread.
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
-    /// The wrapped std guard, which unlocks the mutex and poisons it on a panic.
-    inner: sync::MutexGuard<'a, T>,
+    /// The wrapped guard, which unlocks the mutex and poisons it on a panic.
+    inner: primitives::MutexGuard<'a, T>,
     /// The mutex a condvar wait relocks.
     mutex: &'a Mutex<T>,
 }
@@ -308,13 +320,13 @@ impl WaitTimeoutResult {
 
 /// Checks std parity for the mutex, and condvar waits that follow a clock,
 /// without timed polling.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::TestClock;
     use crate::tests::{blocked, pause_before_park};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{self, Arc, mpsc};
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
