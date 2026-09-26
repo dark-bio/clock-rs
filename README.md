@@ -67,7 +67,7 @@ A condvar waits on this crate's `Mutex`, because relocking after a wait needs th
 
 rustc's `let_underscore_lock` lint knows only std's guards, so it misses `let _ = mutex.lock()` on this crate's mutex, which unlocks at once. The allow-by-default `let_underscore_drop` lint catches it.
 
-`wait_deadline` returns once notified or once the condvar's clock reaches the deadline. As with std's, its `timed_out()` reports a timeout only if the deadline ended the wait before it saw a notification, however late the mutex is relocked. A wait may also return spuriously, including when a notification meant for another waiter ends it. So callers recheck their condition after every return, timeout or not, and a deadline worker picks its earliest deadline again.
+`wait_deadline` returns once notified or once the condvar's clock reaches the deadline. As with std's, its `timed_out()` reports a timeout only if the deadline ended the wait, however late the mutex is relocked, and a notification the wait takes wins over a reached deadline. A `notify_one` ends at most one wait, one already waiting when it was sent. Callers still recheck their condition after every return, timeout or not, and a deadline worker picks its earliest deadline again.
 
 There is no `wait_timeout`. A relative timeout computed as `deadline - now` overshoots when an advance lands between the subtraction and the wait, and on a test clock that overshoot is a hang. A condvar has no `Default` either, since its clock is always explicit.
 
@@ -77,7 +77,7 @@ The `crossbeam` feature adds timers that crossbeam-channel's `select!` can wait 
 
 On a test clock, `at(deadline)` returns a capacity-1 channel. The clock sends the deadline into it once an advance reaches it, or at once when it is already due. The message is the deadline itself, even after an advance that overshoots it, as crossbeam's is. `after(duration)` takes its deadline from the clock when called, and a duration past the end of `Instant`'s range returns a receiver that never fires.
 
-An advance delivers every timer due by its target before any thread can read the new time from the clock. It still sends them one at a time, and a waiting `select!` takes the first one sent. So a `select_biased!` over timers due at the same instant can take a later arm than it would on the real clock, where they become ready together.
+An advance delivers every timer due by its target before any thread can read the new time from the clock. It still sends them one at a time, in deadline order and then in the order they were armed, and a `select!` already waiting takes the first one sent. So a waiting `select_biased!` over timers due at the same instant takes the one armed first, while on the real clock, where they become ready together, it takes the first of their arms. The two agree when each arm arms its own timer, as `recv(clock.at(deadline))` does.
 
 A test clock's timers stay connected until the `TestClock` and every `Clock` handle are gone, so a consumed timer stays connected and empty, as crossbeam's does. The cost is test-only. Memory grows with the timers a test clock delivers, and a timer whose receiver was dropped still counts in `wait_timers` and `next_deadline` until it fires.
 
@@ -97,11 +97,11 @@ Dropping the `TestClock` stops all advances. Its parked sleeps then never end, i
 
 An advance returns once the sleeps and deadline waits it reaches are woken and its due timers hold their messages, not once any thread has acted. Wait for the effect itself, such as a result or a message, before checking it.
 
-An advance wakes only the waits whose deadlines it reaches, and never counts as a notification. Reaching a wait on a condvar wakes the condvar's other waits too, so one that saw an earlier notification returns then, as a spurious wakeup.
+An advance wakes only the waits whose deadlines it reaches, and never counts as a notification. Every other wait keeps waiting until it is notified or reached, still counted by `wait_blocked` and, if it has a deadline, listed by `next_deadline`.
 
 `wait_blocked(n)` returns once at least `n` threads are parked in the clock's sleeps and condvar waits, timed or not. Threads blocked in a crossbeam receive or `select!` are invisible to it, so with `crossbeam`, `wait_timers(n)` waits for at least `n` armed timers instead, counting those of waiting receives. An earlier park or timer counts too, so neither count proves progress on its own.
 
-`next_deadline()` returns the earliest deadline among the clock's parked sleeps, deadline waits and unfired timers, and advancing to it runs a test to its next timeout. A wait stays listed until it stops waiting, so await an advance's effect before reading the next deadline.
+`next_deadline()` returns the earliest deadline among the clock's parked sleeps, deadline waits and unfired timers, and advancing to it runs a test to its next timeout. A wait stays listed until it stops waiting, so one an advance reached stays listed until its thread runs, and is reported at the current time. Await an advance's effect before reading the next deadline.
 
 ### Deadlines
 

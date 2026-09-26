@@ -7,7 +7,7 @@
 //! Checks timer delivery, retention and receive precedence without real deadlines.
 
 use super::*;
-use crate::tests::helpers::{blocked, signals, wakes};
+use crate::tests::helpers::blocked;
 use crossbeam_channel::{Select, bounded, select};
 use std::sync::mpsc;
 use std::thread;
@@ -290,7 +290,7 @@ fn test_next_deadline_combines_timers_and_parked_waits() {
     // Firing the first timer wakes nothing else, leaving the sleep counted and listed
     tester.advance(Duration::from_secs(1));
     assert_eq!(first.try_recv(), Ok(start + Duration::from_secs(1)));
-    assert_eq!(wakes(&signals(&clock)[0]), 0);
+    assert!(!waiting.is_finished());
     assert_eq!(blocked(&clock), 1);
     assert_eq!(tester.next_deadline(), Some(start + Duration::from_secs(2)));
 
@@ -326,6 +326,58 @@ fn test_select_wakes_on_clock_timer() {
     tester.advance_to(deadline);
     assert_eq!(waiting.join().unwrap(), (deadline, deadline));
     assert!(tester.paused.lock().timers.is_empty());
+}
+
+// A blocked select takes the earliest timer when one advance reaches several deadlines.
+#[test]
+fn test_advance_sends_due_timers_in_deadline_order() {
+    // Register a rendezvous arm after both timers to witness the blocked select
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
+    let start = clock.now();
+    let (sender, receiver) = bounded::<()>(0);
+    let waiting = thread::spawn(move || {
+        crossbeam_channel::select_biased! {
+            recv(clock.at(start + Duration::from_secs(1))) -> result => result.unwrap(),
+            recv(clock.at(start + Duration::from_secs(3))) -> result => result.unwrap(),
+            recv(receiver) -> _ => unreachable!(),
+        }
+    });
+    tester.wait_timers(2);
+    let mut ready = Select::new();
+    ready.send(&sender);
+    ready.ready();
+    drop(ready);
+
+    // An advance past both deadlines delivers the earlier timer first
+    tester.advance(Duration::from_secs(5));
+    assert_eq!(waiting.join().unwrap(), start + Duration::from_secs(1));
+}
+
+// Timers sharing a deadline fire in arming order for a blocked biased select.
+#[test]
+fn test_equal_deadline_timers_fire_in_arming_order() {
+    // Arm timers in the order of their select arms and observe select registration
+    let mut tester = TestClock::new();
+    let clock = tester.clock();
+    let deadline = clock.now() + Duration::from_secs(1);
+    let (sender, receiver) = bounded::<()>(0);
+    let waiting = thread::spawn(move || {
+        crossbeam_channel::select_biased! {
+            recv(clock.at(deadline)) -> result => { result.unwrap(); 0 },
+            recv(clock.at(deadline)) -> result => { result.unwrap(); 1 },
+            recv(receiver) -> _ => unreachable!(),
+        }
+    });
+    tester.wait_timers(2);
+    let mut ready = Select::new();
+    ready.send(&sender);
+    ready.ready();
+    drop(ready);
+
+    // The timer armed first wins even though one advance reaches both
+    tester.advance_to(deadline);
+    assert_eq!(waiting.join().unwrap(), 0);
 }
 
 // Both adapters prefer buffered messages and disconnections to reached deadlines.

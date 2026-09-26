@@ -64,9 +64,11 @@ impl Clock {
     /// that overshoots, before any thread can read the new time. The channel
     /// stays connected until the `TestClock` and every `Clock` handle are gone.
     ///
-    /// An advance sends its due timers one at a time, and a waiting `select!`
-    /// takes the first one sent. So a `select_biased!` over timers due at the
-    /// same instant can take a later arm than it would on the real clock.
+    /// An advance sends its due timers one at a time, in deadline order and
+    /// then in the order they were armed, and a `select!` already waiting
+    /// takes the first one sent. So a waiting `select_biased!` over timers due
+    /// at the same instant takes the one armed first, where the real clock's
+    /// takes the first of their arms.
     #[cfg_attr(docsrs, doc(cfg(feature = "crossbeam")))]
     pub fn at(&self, deadline: Instant) -> Receiver<Instant> {
         #[cfg(any(test, feature = "test-clock"))]
