@@ -274,7 +274,7 @@ impl Condvar {
         }
     }
 
-    /// Wakes one thread waiting on this condvar, if any, and no other.
+    /// Wakes one thread waiting on this condvar, if any. The others keep waiting.
     pub fn notify_one(&self) {
         self.waiter.signal.notify_one();
     }

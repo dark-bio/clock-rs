@@ -287,7 +287,7 @@ fn test_next_deadline_combines_timers_and_parked_waits() {
     tester.wait_timers(2);
     assert_eq!(tester.next_deadline(), Some(start + Duration::from_secs(1)));
 
-    // Firing the first timer wakes nothing else, leaving the sleep counted and listed
+    // Firing the first timer leaves the sleep parked, counted and listed
     tester.advance(Duration::from_secs(1));
     assert_eq!(first.try_recv(), Ok(start + Duration::from_secs(1)));
     assert!(!waiting.is_finished());
@@ -529,7 +529,8 @@ fn test_receive_reached_deadline_times_out_without_timer() {
     assert!(tester.paused.lock().fired.is_empty());
 }
 
-// A message or disconnection ends a waiting receive, removing only its own timer.
+// A message or disconnection ends a waiting receive and removes its timer, while
+// a public timer at the same deadline stays armed until it fires.
 #[test]
 fn test_receive_message_or_disconnect_disarms_timer() {
     for relative in [false, true] {
