@@ -210,7 +210,7 @@ impl<T: ?Sized + fmt::Display> fmt::Display for MutexGuard<'_, T> {
 /// Unlike std's, a wait that starts while its thread unwinds from a panic, on
 /// a guard taken before the panic, poisons the mutex as it releases it.
 pub struct Condvar {
-    /// Parks and wakes this condvar's waits, registered with a test clock.
+    /// Parks and wakes this condvar's waits, timing them on its clock.
     waiter: Waiter,
 }
 
@@ -254,9 +254,10 @@ impl Condvar {
     /// `deadline`, then relocks it.
     ///
     /// A deadline already reached returns at once. As with std's, the result
-    /// reports a timeout only if the deadline ended the wait before it saw a
-    /// notification, however late the relock. If a thread panicked while
-    /// holding the mutex, the guard and the result come back inside an error.
+    /// reports a timeout only if the deadline ended the wait, however late the
+    /// relock. A notification this wait takes wins over a reached deadline. If
+    /// a thread panicked while holding the mutex, the guard and the result come
+    /// back inside an error.
     pub fn wait_deadline<'a, T>(
         &self,
         guard: MutexGuard<'a, T>,
@@ -273,7 +274,7 @@ impl Condvar {
         }
     }
 
-    /// Wakes one thread waiting on this condvar, if any.
+    /// Wakes one thread waiting on this condvar, if any. The others keep waiting.
     pub fn notify_one(&self) {
         self.waiter.signal.notify_one();
     }
@@ -290,14 +291,11 @@ impl Condvar {
         guard: MutexGuard<'a, T>,
         deadline: Option<Instant>,
     ) -> (LockResult<MutexGuard<'a, T>>, bool) {
-        // Pick the real timer once, so the test seam reports what every park uses
-        let timer = self.waiter.timer(deadline);
-
         // Start the wait under the caller's mutex, so that a notification sent
         // after the caller's last check cannot slip past it
         let MutexGuard { inner, mutex } = guard;
         let mut state = self.waiter.signal.lock();
-        let notifications = state.notifications;
+        let start = state.start();
         #[cfg(test)]
         if let Some(hook) = self
             .waiter
@@ -308,7 +306,7 @@ impl Condvar {
         {
             // Let tests act while the caller's mutex is still held
             drop(state);
-            hook(timer);
+            hook(self.waiter.timer(deadline));
             state = self.waiter.signal.lock();
         }
 
@@ -316,8 +314,7 @@ impl Condvar {
         drop(inner);
 
         // Park until notified or the deadline passes, and note which while the signal is locked
-        state = self.waiter.park(state, notifications, deadline, timer);
-        let notified = state.notifications != notifications;
+        let (state, notified) = self.waiter.park(state, start, deadline);
 
         // Unlock the signal first, since notifiers take the two locks the other way round
         drop(state);
@@ -334,15 +331,15 @@ impl fmt::Debug for Condvar {
     }
 }
 
-/// Whether a deadline wait ended at its deadline, before seeing a notification.
+/// Whether the clock's deadline ended a wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaitTimeoutResult(
-    /// Whether the deadline ended the wait before it saw a notification.
+    /// Whether the deadline ended the wait.
     bool,
 );
 
 impl WaitTimeoutResult {
-    /// Returns whether the deadline ended the wait before it saw a notification.
+    /// Returns whether the deadline ended the wait.
     #[must_use]
     pub fn timed_out(&self) -> bool {
         self.0

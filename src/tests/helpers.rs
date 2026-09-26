@@ -7,9 +7,9 @@
 //! Helpers that the tests of several modules share.
 
 use crate::{Clock, Signal, paused};
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Returns the number of threads parked on a test clock.
@@ -20,22 +20,6 @@ pub(crate) fn blocked(clock: &Clock) -> usize {
 /// Returns how many times advances woke a signal.
 pub(crate) fn wakes(signal: &Signal) -> usize {
     signal.wakes.load(Ordering::SeqCst)
-}
-
-/// Returns every signal registered on a test clock, kept alive so that their
-/// wakes can be read after their waits end.
-pub(crate) fn signals(clock: &Clock) -> Vec<Arc<Signal>> {
-    clock
-        .paused
-        .as_ref()
-        .unwrap()
-        .state
-        .lock()
-        .unwrap()
-        .signals
-        .values()
-        .map(|signal| signal.upgrade().expect("registered signal is live"))
-        .collect()
 }
 
 /// Stops the next wait before it parks, and reports its real timer.
