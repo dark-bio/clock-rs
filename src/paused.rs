@@ -40,7 +40,8 @@ impl TestClock {
                         instant: now,
                     },
                     sequence: 0,
-                    blocked: 0,
+                    registered: 0,
+                    notified: 0,
                     deadlines: BTreeMap::new(),
                     #[cfg(feature = "crossbeam")]
                     timers: BTreeMap::new(),
@@ -49,9 +50,11 @@ impl TestClock {
                 }),
                 changed: Condvar::new(),
                 #[cfg(test)]
-                before_park: std::sync::Mutex::new(None),
+                before_wait: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 before_rewait: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                before_parked_wait: std::sync::Mutex::new(None),
                 #[cfg(all(test, feature = "crossbeam"))]
                 after_timer_receive: std::sync::Mutex::new(None),
             }),
@@ -113,16 +116,54 @@ impl TestClock {
         };
     }
 
-    /// Blocks until at least `count` threads are parked in this clock's sleeps
-    /// and condvar waits.
+    /// Blocks until at least `count` clock sleeps or condvar waits are
+    /// registered, timed or not.
     ///
-    /// Threads blocked in crossbeam receives and selects do not count. A thread
-    /// parked earlier counts too, so the count proves no progress on its own.
-    /// Nothing bounds the wait, so run tests under a runner with a per-test
-    /// timeout, since `cargo test` alone never stops a hung test.
-    pub fn wait_blocked(&self, count: usize) {
+    /// A wait stays registered from the moment it starts waiting until it
+    /// returns. So the count includes a thread that a notification or an
+    /// advance has woken but that has not run yet. Threads blocked in crossbeam
+    /// receives, selects or mutexes, or busy outside clock waits, do not count.
+    /// An earlier registration counts too, so the count proves no progress on
+    /// its own. Nothing bounds the wait, so run tests under a runner with a
+    /// per-test timeout, since `cargo test` alone never stops a hung test.
+    pub fn wait_registered(&self, count: usize) {
         let mut state = self.paused.lock();
-        while state.blocked < count {
+        while state.registered < count {
+            state = self
+                .paused
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Blocks until at least `count` registered waits are parked, with their
+    /// deadlines unreached or absent, and no notification on this clock is
+    /// outstanding.
+    ///
+    /// A notification stays outstanding until every wait it ended has
+    /// returned. So a woken thread that has not run yet holds the barrier, on
+    /// whichever condvar of this clock it waits.
+    ///
+    /// The count must cover every worker the test expects to park, and the
+    /// test must control the work they receive. Threads blocked in crossbeam
+    /// receives, selects or mutexes, or busy outside clock waits, are invisible
+    /// to it, and a worker that exits never counts again. Nothing bounds the
+    /// wait, so run tests under a runner with a per-test timeout.
+    pub fn wait_parked(&self, count: usize) {
+        let mut state = self.paused.lock();
+        while !state.parked(count) {
+            // Let a test release a held worker once this barrier must wait
+            #[cfg(test)]
+            {
+                let hook = self.paused.before_parked_wait.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    drop(state);
+                    hook();
+                    state = self.paused.lock();
+                    continue;
+                }
+            }
             state = self
                 .paused
                 .changed
@@ -150,15 +191,15 @@ impl TestClock {
         }
     }
 
-    /// Returns the earliest deadline among this clock's parked sleeps, deadline
-    /// waits and unfired timers, or `None` when there is none.
+    /// Returns the earliest deadline among this clock's registered sleeps,
+    /// deadline waits and unfired timers, or `None` when there is none.
     ///
     /// A timed wait stays listed until it stops waiting, so one an advance
     /// reaches stays listed until its thread runs, and the result is then the
     /// current time. Await an advance's effect before reading the next
     /// deadline. A timer leaves the list when it fires.
     pub fn next_deadline(&self) -> Option<Instant> {
-        // Compare the earliest parked wait with the earliest unfired timer, and report
+        // Compare the earliest registered wait with the earliest unfired timer, and report
         // one already reached at the current time, so that advancing to it stays valid
         let state = self.paused.lock();
         let deadline = state.deadlines.keys().next().map(|&(deadline, _)| deadline);
@@ -186,8 +227,8 @@ impl TestClock {
         wall.at(next).expect("clock advance overflows SystemTime");
 
         // Publish the time and collect each reached wait's signal once, in the same
-        // lock hold that parks register in. The wakes follow deadline and park order,
-        // since the address set only filters out repeats.
+        // lock hold that registrations take. The wakes follow deadline and
+        // registration order, since the address set only filters out repeats.
         let mut state = self.paused.lock();
         state.now = next;
         let mut seen = HashSet::new();
@@ -212,7 +253,7 @@ impl TestClock {
         }
         drop(state);
 
-        // Wake outside the clock lock, since parking takes the signal lock first
+        // Wake outside the clock lock, since registration takes the signal lock first
         for signal in signals {
             signal.wake();
         }
@@ -227,13 +268,13 @@ impl Default for TestClock {
 }
 
 impl fmt::Debug for TestClock {
-    /// Shows the advance, wall time, parked threads and armed timers.
+    /// Shows the advance, wall time, registered waits and armed timers.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Snapshot the counts before calling the formatter's writer
         let state = self.paused.lock();
         let advanced = state.now - self.paused.start;
         let system_time = state.system_time();
-        let blocked = state.blocked;
+        let registered = state.registered;
         #[cfg(feature = "crossbeam")]
         let timers = state.timers.len();
         drop(state);
@@ -243,7 +284,7 @@ impl fmt::Debug for TestClock {
         debug
             .field("advanced", &advanced)
             .field("system_time", &system_time)
-            .field("blocked", &blocked);
+            .field("registered", &registered);
         #[cfg(feature = "crossbeam")]
         debug.field("timers", &timers);
         debug.finish()
@@ -254,18 +295,21 @@ impl fmt::Debug for TestClock {
 pub(crate) struct Paused {
     /// Time the clock started at, to show how far it has advanced.
     start: Instant,
-    /// Current times, parked thread count, deadlines and timers.
+    /// Current times, registered wait count, deadlines and timers.
     pub(crate) state: Mutex<PausedState>,
-    /// Wakes drivers when parked threads or armed timers change.
+    /// Wakes drivers when registrations, notifications or armed timers change.
     pub(crate) changed: Condvar,
-    /// One-shot test hook, run before a park's first wait with no clock or
+    /// One-shot test hook, run before a wait's registration with no clock or
     /// signal lock held.
     #[cfg(test)]
-    pub(crate) before_park: std::sync::Mutex<Option<BeforePark>>,
-    /// One-shot test hook, run like `before_park` before a park waits again
+    pub(crate) before_wait: std::sync::Mutex<Option<BeforeWait>>,
+    /// One-shot test hook, run like `before_wait` before a registered wait waits again
     /// after a spurious wakeup.
     #[cfg(test)]
-    pub(crate) before_rewait: std::sync::Mutex<Option<BeforePark>>,
+    pub(crate) before_rewait: std::sync::Mutex<Option<BeforeWait>>,
+    /// Test hook before `wait_parked` blocks, run once with no clock lock held.
+    #[cfg(test)]
+    pub(crate) before_parked_wait: std::sync::Mutex<Option<BeforeParkedWait>>,
     /// One-shot test hook, run when a receive's timer wins, before the receiver
     /// is checked again, with no crate lock held.
     #[cfg(all(test, feature = "crossbeam"))]
@@ -278,13 +322,15 @@ pub(crate) struct PausedState {
     now: Instant,
     /// Wall time as last set, with the monotonic instant it was set at.
     wall: WallAnchor,
-    /// Last sequence number given to a timed park or timer, which a `u64`
+    /// Last sequence number given to a timed wait or timer, which a `u64`
     /// cannot outgrow within any run.
     sequence: u64,
-    /// Threads committed to parking while holding their signal's lock.
-    pub(crate) blocked: usize,
-    /// Parked timed waits by deadline and park order, each with the signal
-    /// that wakes it, and each unlisted when its park ends.
+    /// Clock waits registered until their calls return, including woken waits.
+    pub(crate) registered: usize,
+    /// Notifications whose affected waits have not finished retiring.
+    notified: usize,
+    /// Registered timed waits by deadline and registration order, each with
+    /// its signal and unlisted when its wait returns.
     deadlines: BTreeMap<(Instant, u64), Arc<Signal>>,
     /// Unfired timers by deadline and arming order.
     #[cfg(feature = "crossbeam")]
@@ -296,7 +342,17 @@ pub(crate) struct PausedState {
 }
 
 impl PausedState {
-    /// Keys a timed park or timer by its deadline, ordering equal deadlines by
+    /// Reports whether at least `count` waits are parked with no outstanding notification.
+    pub(crate) fn parked(&self, count: usize) -> bool {
+        self.notified == 0 && self.unreached() >= count
+    }
+
+    /// Counts registered waits whose deadlines have not been reached.
+    fn unreached(&self) -> usize {
+        self.registered - self.deadlines.range(..=(self.now, u64::MAX)).count()
+    }
+
+    /// Keys a timed wait or timer by its deadline, ordering equal deadlines by
     /// when they were listed.
     fn next_key(&mut self, deadline: Instant) -> (Instant, u64) {
         self.sequence += 1;
@@ -371,6 +427,13 @@ impl WallAnchor {
 }
 
 impl Paused {
+    /// Replaces one signal's contribution to the outstanding notifications.
+    pub(crate) fn notifications(&self, previous: usize, current: usize) {
+        let mut state = self.lock();
+        state.notified = state.notified - previous + current;
+        self.changed.notify_all();
+    }
+
     /// Returns armed timers and retained senders for the bookkeeping model.
     #[cfg(all(test, feature = "crossbeam", not(loom)))]
     pub(crate) fn timer_counts(&self) -> (usize, usize) {
@@ -467,43 +530,43 @@ impl Paused {
         (state.now - self.start, state.system_time())
     }
 
-    /// Counts a park and lists its deadline until the guard drops, or returns
+    /// Counts a wait and lists its deadline until the guard drops, or returns
     /// `None` if the deadline has already been reached.
     ///
-    /// Advances collect the waits to wake under the same lock, so a park either
+    /// Advances collect the waits to wake under the same lock, so a wait either
     /// registers in time to be woken or sees the new time. The caller holds its
     /// signal lock until it waits, so the wake cannot arrive before the wait.
-    pub(crate) fn block(
+    pub(crate) fn register(
         &self,
         deadline: Option<Instant>,
         signal: &Arc<Signal>,
-    ) -> Option<Blocked<'_>> {
+    ) -> Option<Registration<'_>> {
         // Refuse a deadline that an advance has already reached
         let mut state = self.lock();
         if deadline.is_some_and(|deadline| deadline <= state.now) {
             return None;
         }
 
-        // Count the park, and list a timed one under its own key
+        // Count the wait, and list a timed one under its own key
         let key = deadline.map(|deadline| state.next_key(deadline));
-        state.blocked += 1;
+        state.registered += 1;
         if let Some(key) = key {
             state.deadlines.insert(key, signal.clone());
         }
 
         // Wake drivers waiting for the count to grow
         self.changed.notify_all();
-        Some(Blocked { paused: self, key })
+        Some(Registration { paused: self, key })
     }
 
-    /// Takes the one-shot test hook for a park's first wait, or for a wait
+    /// Takes the one-shot test hook before registration, or for a wait
     /// `again` after a spurious wakeup, for the caller to run with no lock held.
     #[cfg(test)]
-    pub(crate) fn take_hook(&self, again: bool) -> Option<BeforePark> {
+    pub(crate) fn take_hook(&self, again: bool) -> Option<BeforeWait> {
         let hook = if again {
             &self.before_rewait
         } else {
-            &self.before_park
+            &self.before_wait
         };
         hook.lock().unwrap().take()
     }
@@ -543,33 +606,37 @@ impl Drop for ReceiveTimer<'_> {
     }
 }
 
-/// Counts one park, and lists its deadline, from its first wait until it returns.
-pub(crate) struct Blocked<'a> {
-    /// Clock whose parked count includes this thread.
+/// Counts one registered wait and lists its deadline until the wait returns.
+pub(crate) struct Registration<'a> {
+    /// Clock whose registration count includes this thread.
     paused: &'a Paused,
-    /// Key of this park's listed deadline, if it is timed.
+    /// Key of this wait's listed deadline, if it is timed.
     key: Option<(Instant, u64)>,
 }
 
-impl Drop for Blocked<'_> {
-    /// Removes this thread and its deadline from the clock's parked state.
+impl Drop for Registration<'_> {
+    /// Removes this wait and its deadline from the clock's registrations.
     fn drop(&mut self) {
-        // Uncount the park and unlist its deadline
+        // Uncount the wait and unlist its deadline
         let mut state = self.paused.lock();
-        state.blocked -= 1;
+        state.registered -= 1;
         if let Some(key) = self.key {
             state.deadlines.remove(&key);
         }
 
-        // Only the test helper wait_unblocked waits for this count to drop
+        // The test helper wait_unregistered waits for this count to drop
         #[cfg(test)]
         self.paused.changed.notify_all();
     }
 }
 
-/// Pauses a test wait before parking and exposes its real timer, if any.
+/// Pauses a test wait before registration and exposes its real timer, if any.
 #[cfg(test)]
-pub(crate) type BeforePark = Box<dyn FnOnce(Option<Instant>) + Send>;
+pub(crate) type BeforeWait = Box<dyn FnOnce(Option<Instant>) + Send>;
+
+/// Observes a parked wait barrier that cannot yet return.
+#[cfg(test)]
+pub(crate) type BeforeParkedWait = Box<dyn FnOnce() + Send>;
 
 /// Observes a timer race with no crate lock held.
 #[cfg(all(test, feature = "crossbeam"))]

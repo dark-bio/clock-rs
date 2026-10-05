@@ -132,7 +132,7 @@ impl Clock {
     ///
     /// On a test clock, only its advances end the sleep.
     pub fn sleep_until(&self, deadline: Instant) {
-        // A test clock's sleep parks until an advance reaches its deadline
+        // A test clock's sleep waits until an advance reaches its deadline
         #[cfg(any(test, feature = "test-clock"))]
         if self.paused.is_some() {
             self.waiter().wait(Some(deadline));
@@ -162,7 +162,11 @@ impl Clock {
     fn waiter(&self) -> Waiter {
         Waiter {
             clock: self.clone(),
-            signal: Arc::new(Signal::default()),
+            signal: Arc::new(Signal {
+                #[cfg(any(test, feature = "test-clock"))]
+                paused: self.paused.as_ref().map(Arc::downgrade),
+                ..Signal::default()
+            }),
         }
     }
 }
@@ -220,13 +224,13 @@ struct Waiter {
 }
 
 impl Waiter {
-    /// Starts a wait and parks until a notification ends it or the clock
+    /// Starts a wait and blocks until a notification ends it or the clock
     /// reaches `deadline`, returning whether a notification ended it.
     #[cfg(any(test, feature = "test-clock"))]
     fn wait(&self, deadline: Option<Instant>) -> bool {
         let mut state = self.signal.lock();
         let start = state.start();
-        self.park(state, start, deadline).1
+        self.wait_locked(state, start, deadline).1
     }
 
     /// Returns the deadline as a real timer on a real clock, and no timer on a
@@ -239,16 +243,15 @@ impl Waiter {
         deadline
     }
 
-    /// Parks the wait that started at `start` until a notification ends it or
-    /// the clock reaches `deadline`. Returns the state locked again, and
-    /// whether a notification ended the wait.
+    /// Waits, with the signal state locked on entry and return, until a
+    /// notification ends the wait that started at `start` or the clock
+    /// reaches `deadline`, returning whether a notification ended it.
     ///
-    /// On a test clock, the park counts as blocked and lists its deadline from
-    /// its first wait until it returns, however often it wakes in between. Only
-    /// a real clock's park uses a real timer. In tests, one-shot hooks run
-    /// before its first wait and before a wait after a spurious wakeup, with
-    /// the signal unlocked.
-    fn park<'a>(
+    /// On a test clock, the wait stays registered with its deadline until it
+    /// returns, including after a wake. Only a real clock uses a real timer.
+    /// Test hooks run with the signal unlocked before registration and before
+    /// a repeated wait after a spurious wake.
+    fn wait_locked<'a>(
         &'a self,
         mut state: MutexGuard<'a, SignalState>,
         start: u64,
@@ -257,9 +260,9 @@ impl Waiter {
         // Only a real clock times its waits, since a test clock's advances end them
         let timer = self.timer(deadline);
 
-        // Count the park once, keeping it counted through every wakeup until it returns
+        // Keep the wait registered through every wakeup until it returns
         #[cfg(any(test, feature = "test-clock"))]
-        let mut blocked = None;
+        let mut registration = None;
 
         let notified = loop {
             // Take a notification first, so that one wins over a reached deadline
@@ -278,7 +281,7 @@ impl Waiter {
                 .clock
                 .paused
                 .as_ref()
-                .and_then(|paused| paused.take_hook(blocked.is_some()))
+                .and_then(|paused| paused.take_hook(registration.is_some()))
             {
                 drop(state);
                 hook(timer);
@@ -286,21 +289,21 @@ impl Waiter {
                 continue;
             }
 
-            // Count the park under the clock lock, so an advance either finds it or has
+            // Register under the clock lock, so an advance either finds the wait or has
             // already passed its deadline
             #[cfg(any(test, feature = "test-clock"))]
-            if blocked.is_none() {
+            if registration.is_none() {
                 if let Some(paused) = &self.clock.paused {
-                    blocked = paused.block(deadline, &self.signal);
-                    if blocked.is_none() {
+                    registration = paused.register(deadline, &self.signal);
+                    if registration.is_none() {
                         break false;
                     }
                 }
             }
             #[cfg(test)]
             {
-                state.parks += 1;
-                self.signal.parked.notify_all();
+                state.waits += 1;
+                self.signal.entered.notify_all();
             }
 
             // Wait for a wakeup or the real timer, leaving expiry to the check above
@@ -323,22 +326,27 @@ impl Waiter {
         // Retire and unlist the wait under the signal lock before its caller acts
         state.retire(start);
         #[cfg(any(test, feature = "test-clock"))]
-        drop(blocked);
+        drop(registration);
+        #[cfg(any(test, feature = "test-clock"))]
+        self.signal.publish(&mut state);
         (state, notified)
     }
 }
 
-/// Hands notifications to a waiter's waits and wakes parked threads to check
+/// Hands notifications to registered waits and wakes threads to check
 /// for one or for their deadline.
 #[derive(Default)]
 struct Signal {
-    /// Notification bookkeeping and the test park count, guarded together.
+    /// Clock observing outstanding notifications for its parked wait barrier.
+    #[cfg(any(test, feature = "test-clock"))]
+    paused: Option<std::sync::Weak<paused::Paused>>,
+    /// Notification bookkeeping and the test wait count, guarded together.
     state: Mutex<SignalState>,
-    /// Wakes parked threads for a notification or a reached deadline.
+    /// Wakes waiting threads for a notification or a reached deadline.
     changed: Condvar,
-    /// Reports new parks to tests, without waking parked threads.
+    /// Reports new physical waits to tests without waking the waiting threads.
     #[cfg(test)]
-    parked: Condvar,
+    entered: Condvar,
     /// Clock wakes delivered, so tests can check which waits an advance reached.
     #[cfg(test)]
     wakes: AtomicUsize,
@@ -360,9 +368,15 @@ struct SignalState {
     waiting: usize,
     /// Numbers of the `notify_one` calls no wait has taken yet, oldest first.
     pending: VecDeque<u64>,
+    /// Waits ended by broadcasts that have not yet returned.
+    #[cfg(any(test, feature = "test-clock"))]
+    ended: usize,
+    /// Notification obligations last published to the test clock.
+    #[cfg(any(test, feature = "test-clock"))]
+    published: usize,
     /// Total physical waits entered, for test synchronization.
     #[cfg(test)]
-    parks: usize,
+    waits: usize,
 }
 
 impl SignalState {
@@ -393,6 +407,11 @@ impl SignalState {
     fn retire(&mut self, start: u64) {
         if self.broadcast <= start {
             self.waiting -= 1;
+        } else {
+            #[cfg(any(test, feature = "test-clock"))]
+            {
+                self.ended -= 1;
+            }
         }
     }
 }
@@ -404,36 +423,61 @@ impl Signal {
     }
 
     /// Queues a notification for one of the waits already started, and wakes a
-    /// parked thread to take it. Queues none once every counted wait has one.
+    /// waiting thread to take it. Queues none once every counted wait has one.
     fn notify_one(&self) {
         let mut state = self.lock();
         state.notifications += 1;
         if state.pending.len() < state.waiting {
             let sent = state.notifications;
             state.pending.push_back(sent);
+            #[cfg(any(test, feature = "test-clock"))]
+            self.publish(&mut state);
             self.changed.notify_one();
         }
     }
 
     /// Ends every wait started so far, dropping their queued notifications,
-    /// and wakes every parked thread.
+    /// and wakes every waiting thread.
     fn notify_all(&self) {
         // Uncount the ended waits at once, so that no later notify_one queues one for them
         let mut state = self.lock();
         state.notifications += 1;
         state.broadcast = state.notifications;
         state.pending.clear();
+        #[cfg(any(test, feature = "test-clock"))]
+        {
+            state.ended += state.waiting;
+        }
         state.waiting = 0;
+        #[cfg(any(test, feature = "test-clock"))]
+        self.publish(&mut state);
         self.changed.notify_all();
     }
 
-    /// Wakes every parked thread to recheck the time, without counting a notification.
+    /// Publishes this signal's outstanding notifications to its clock while the
+    /// signal stays locked.
+    ///
+    /// Claiming a credit alone publishes nothing. A wait publishes only after
+    /// it retires and drops its registration, so the parked wait barrier never
+    /// counts a wait whose credit it has already consumed.
+    #[cfg(any(test, feature = "test-clock"))]
+    fn publish(&self, state: &mut SignalState) {
+        if let Some(paused) = self.paused.as_ref().and_then(std::sync::Weak::upgrade) {
+            let pending = state.ended + state.pending.len();
+            if pending != state.published {
+                paused.notifications(state.published, pending);
+                state.published = pending;
+            }
+        }
+    }
+
+    /// Wakes every waiting thread to recheck the time without counting a notification.
     #[cfg(any(test, feature = "test-clock"))]
     fn wake(&self) {
         #[cfg(test)]
         self.wakes.fetch_add(1, Ordering::SeqCst);
 
-        // Take the lock, so a park that read the time before the advance is waiting by now
+        // Take the lock, so a thread that read the time before the advance is waiting by now
         let _state = self.lock();
         self.changed.notify_all();
     }

@@ -6,7 +6,7 @@
 
 //! Checks clock control, sleep races and notification bookkeeping.
 
-use super::helpers::{blocked, last_system_time, pause_before_park, pause_before_rewait, wakes};
+use super::helpers::{last_system_time, pause_before_rewait, pause_before_wait, registered, wakes};
 use crate::{Clock, TestClock, Waiter};
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
@@ -14,13 +14,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Blocks until `count` waits have started on the waiter. Each wait parks in
-/// the signal lock hold that starts it, so its park report covers its start,
-/// while a spurious wakeup's second park adds no start.
+/// Blocks until `count` waits have started on the waiter.
+///
+/// Each physical wait starts under the signal lock, so its report covers its
+/// start. A repeated wait after a spurious wake adds no start.
 fn started(waiter: &Waiter, count: usize) {
     let mut state = waiter.signal.lock();
     while state.waiting < count {
-        state = waiter.signal.parked.wait(state).unwrap();
+        state = waiter.signal.entered.wait(state).unwrap();
     }
 }
 
@@ -98,7 +99,7 @@ fn test_debug_writer_can_read_clock() {
     fmt::write(&mut writer, format_args!("{tester:?}")).unwrap();
 
     // Returning at all shows no lock was held while writing, and every field came out
-    for field in ["advanced:", "system_time:", "blocked:"] {
+    for field in ["advanced:", "system_time:", "registered:"] {
         assert!(writer.output.contains(field), "{field}");
     }
     #[cfg(feature = "crossbeam")]
@@ -279,15 +280,15 @@ fn test_failed_wall_advance_keeps_both_times() {
 }
 
 // Both sleep methods observe an advance between the deadline check and the
-// park, without a real timer.
+// registration, without a real timer.
 #[test]
-fn test_sleep_observes_advance_before_parking() {
+fn test_sleep_observes_advance_before_registration() {
     for until in [false, true] {
-        // Start a sleeper that stops right after its deadline check, before it parks
+        // Stop a sleeper after its deadline check and before registration
         let mut tester = TestClock::new();
         let clock = tester.clock();
         let deadline = clock.now() + Duration::from_secs(60);
-        let (checked, resume) = pause_before_park(&clock);
+        let (checked, resume) = pause_before_wait(&clock);
         let waiting = thread::spawn(move || {
             if until {
                 clock.sleep_until(deadline);
@@ -297,21 +298,21 @@ fn test_sleep_observes_advance_before_parking() {
             clock.now()
         });
 
-        // It is about to park without a real timer; advance to its deadline meanwhile
+        // Advance to the deadline while the sleeper is about to register without a real timer
         assert_eq!(checked.recv().unwrap(), None, "{until}");
         tester.advance_to(deadline);
 
-        // Resumed, it must notice the advance instead of parking for good
+        // Resume the sleeper, which must notice the advance and return
         resume.send(()).unwrap();
         assert_eq!(waiting.join().unwrap(), deadline, "{until}");
     }
 }
 
-// An advance wakes every parked sleeper across cloned handles and leaves
+// An advance wakes every registered sleeper across cloned handles and leaves
 // none of them counted or listed.
 #[test]
-fn test_advance_wakes_all_parked_sleepers() {
-    // Park six sleepers on clones of one handle, half with each sleep method
+fn test_advance_wakes_all_registered_sleepers() {
+    // Register six sleepers on clones of one handle, half with each sleep method
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let deadline = clock.now() + Duration::from_secs(60);
@@ -328,8 +329,8 @@ fn test_advance_wakes_all_parked_sleepers() {
             })
         })
         .collect();
-    tester.wait_blocked(6);
-    assert_eq!(blocked(&clock), 6);
+    tester.wait_registered(6);
+    assert_eq!(registered(&clock), 6);
 
     // One advance releases all of them at the shared deadline
     tester.advance(Duration::from_secs(60));
@@ -337,8 +338,8 @@ fn test_advance_wakes_all_parked_sleepers() {
         assert_eq!(waiting.join().unwrap(), deadline);
     }
 
-    // Their parks are uncounted and their deadlines unlisted with them
-    assert_eq!(blocked(&clock), 0);
+    // Their registrations and deadlines are removed together
+    assert_eq!(registered(&clock), 0);
     assert_eq!(tester.next_deadline(), None);
 }
 
@@ -358,10 +359,10 @@ fn test_sleep_returns_for_reached_deadlines() {
     }
 }
 
-// Wall jumps and zero advances leave monotonic time in place and wake no parked sleeper.
+// Wall jumps and zero advances leave monotonic time in place and wake no sleeper.
 #[test]
 fn test_wall_jumps_and_zero_advances_do_not_wake() {
-    // Park a waiter three seconds ahead of its deadline
+    // Register a waiter three seconds ahead of its deadline
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let now = clock.now();
@@ -370,7 +371,7 @@ fn test_wall_jumps_and_zero_advances_do_not_wake() {
         let waiter = waiter.clone();
         move || waiter.wait(Some(now + Duration::from_secs(3)))
     });
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
 
     // Wall jumps and advances that leave monotonic time in place do not wake it
     for seconds in [100, 50] {
@@ -388,10 +389,10 @@ fn test_wall_jumps_and_zero_advances_do_not_wake() {
     assert!(!waiting.join().unwrap());
 }
 
-// A spurious wakeup keeps the park counted and its deadline listed.
+// A spurious wakeup keeps the wait registered and its deadline listed.
 #[test]
-fn test_spurious_wakeup_keeps_park_counted() {
-    // Park a timed wait on a waiter the test can reach
+fn test_spurious_wakeup_keeps_wait_registered() {
+    // Register a timed wait on a waiter the test can reach
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let deadline = clock.now() + Duration::from_secs(1);
@@ -400,7 +401,7 @@ fn test_spurious_wakeup_keeps_park_counted() {
         let waiter = waiter.clone();
         move || waiter.wait(Some(deadline))
     });
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
 
     // Wake it through std alone, locking the signal so the wakeup reaches the wait
     let (checked, resume) = pause_before_rewait(&clock);
@@ -410,8 +411,8 @@ fn test_spurious_wakeup_keeps_park_counted() {
     }
     assert_eq!(checked.recv().unwrap(), None);
 
-    // Caught between its two waits, the park still counts and lists its deadline
-    assert_eq!(blocked(&clock), 1);
+    // Between physical waits, the registration still counts and lists its deadline
+    assert_eq!(registered(&clock), 1);
     assert_eq!(tester.next_deadline(), Some(deadline));
     resume.send(()).unwrap();
 
@@ -420,7 +421,7 @@ fn test_spurious_wakeup_keeps_park_counted() {
     assert!(!waiting.join().unwrap());
 }
 
-// A poisoned shared lock still permits reading, setting, parking, counting and advancing time.
+// A poisoned shared lock still permits reading, setting, registering, counting and advancing time.
 #[test]
 fn test_poisoned_clock_remains_usable() {
     // Record both times before the shared clock lock is poisoned
@@ -445,52 +446,52 @@ fn test_poisoned_clock_remains_usable() {
     assert_eq!(clock.system_time(), wall);
     tester.set_system_time(UNIX_EPOCH);
 
-    // So do parking, counting and advancing
+    // Check that registration, counting and advancing also work
     let waiting = thread::spawn({
         let clock = clock.clone();
         move || clock.sleep(Duration::from_secs(1))
     });
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
     tester.advance_to(now + Duration::from_secs(1));
     waiting.join().unwrap();
     assert_eq!(clock.now(), now + Duration::from_secs(1));
     assert_eq!(clock.system_time(), UNIX_EPOCH + Duration::from_secs(1));
 }
 
-// A park returns a timeout immediately for a reached deadline on either clock.
+// A wait returns a timeout immediately for a reached deadline on either clock.
 #[test]
-fn test_park_returns_for_reached_deadline() {
+fn test_wait_returns_for_reached_deadline() {
     for clock in [Clock::real(), TestClock::new().clock()] {
-        // Start and retire the wait without entering a physical park
+        // Start and retire the wait without entering a physical wait
         let waiter = clock.waiter();
         let now = clock.now();
         let mut state = waiter.signal.lock();
         let start = state.start();
-        let (state, notified) = waiter.park(state, start, Some(now));
+        let (state, notified) = waiter.wait_locked(state, start, Some(now));
         assert!(!notified, "{clock:?}");
-        assert_eq!(state.parks, 0, "{clock:?}");
+        assert_eq!(state.waits, 0, "{clock:?}");
         assert_eq!(state.waiting, 0, "{clock:?}");
     }
 }
 
-// A notification sent after a wait starts cannot be lost before parking.
+// A notification sent after a wait starts cannot be lost before registration.
 #[test]
-fn test_park_observes_notification_before_parking() {
+fn test_wait_observes_notification_before_registration() {
     for clock in [Clock::real(), TestClock::new().clock()] {
-        // Notify between starting the wait and entering its park
+        // Notify between starting the wait and registering it
         let waiter = clock.waiter();
         let start = waiter.signal.lock().start();
         waiter.signal.notify_all();
-        let (state, notified) = waiter.park(waiter.signal.lock(), start, None);
+        let (state, notified) = waiter.wait_locked(waiter.signal.lock(), start, None);
         assert!(notified, "{clock:?}");
-        assert_eq!(state.parks, 0, "{clock:?}");
+        assert_eq!(state.waits, 0, "{clock:?}");
         assert_eq!(state.waiting, 0, "{clock:?}");
     }
 }
 
-// An advance between starting a wait and parking ends it without blocking.
+// An advance between starting a wait and registering ends it without blocking.
 #[test]
-fn test_park_observes_advance_before_parking() {
+fn test_wait_observes_advance_before_registration() {
     // Start a timed wait before advancing to its deadline
     let mut tester = TestClock::new();
     let clock = tester.clock();
@@ -499,19 +500,19 @@ fn test_park_observes_advance_before_parking() {
     let start = waiter.signal.lock().start();
     tester.advance_to(deadline);
 
-    // The park sees the reached deadline and retires immediately
-    let (state, notified) = waiter.park(waiter.signal.lock(), start, Some(deadline));
+    // The wait sees the reached deadline and retires immediately
+    let (state, notified) = waiter.wait_locked(waiter.signal.lock(), start, Some(deadline));
     assert!(!notified);
     assert_eq!(clock.now(), deadline);
-    assert_eq!(state.parks, 0);
+    assert_eq!(state.waits, 0);
     assert_eq!(state.waiting, 0);
 }
 
 // One notification wakes every thread sharing a waiter on either kind of clock.
 #[test]
-fn test_notify_wakes_all_parked_waiters() {
+fn test_notify_wakes_all_registered_waiters() {
     for clock in [Clock::real(), TestClock::new().clock()] {
-        // Park two threads on one shared waiter
+        // Register two threads on one shared waiter
         let waiter = Arc::new(clock.waiter());
         let threads: Vec<_> = (0..2)
             .map(|_| {
@@ -529,47 +530,47 @@ fn test_notify_wakes_all_parked_waiters() {
     }
 }
 
-// A timed registration retains its signal only until the park retires.
+// A timed registration retains its signal until the registration is removed.
 #[test]
-fn test_park_registration_retains_signal_until_retired() {
-    // Register a park and release the waiter's ownership of its signal
+fn test_registration_retains_signal_until_removed() {
+    // Register a wait and release the waiter's ownership of its signal
     let tester = TestClock::new();
     let clock = tester.clock();
     let paused = clock.paused.as_ref().unwrap();
     let waiter = clock.waiter();
     let signal = Arc::downgrade(&waiter.signal);
     let deadline = clock.now() + Duration::from_secs(1);
-    let registration = paused.block(Some(deadline), &waiter.signal).unwrap();
+    let registration = paused.register(Some(deadline), &waiter.signal).unwrap();
     drop(waiter);
     assert!(signal.upgrade().is_some());
     assert_eq!(tester.next_deadline(), Some(deadline));
 
-    // Retiring the park removes its deadline and releases its signal
+    // Removing the registration removes its deadline and releases its signal
     drop(registration);
     assert!(signal.upgrade().is_none());
     assert_eq!(tester.next_deadline(), None);
-    assert_eq!(blocked(&clock), 0);
+    assert_eq!(registered(&clock), 0);
 }
 
-// Retiring one park preserves another park with the same signal and deadline.
+// Removing one registration preserves another with the same signal and deadline.
 #[test]
-fn test_retiring_park_keeps_shared_deadline_listed() {
-    // Register two parks sharing both their signal and deadline
+fn test_removing_registration_keeps_shared_deadline_listed() {
+    // Register two waits sharing both their signal and deadline
     let tester = TestClock::new();
     let clock = tester.clock();
     let waiter = clock.waiter();
     let paused = clock.paused.as_ref().unwrap();
     let deadline = clock.now() + Duration::from_secs(1);
-    let survivor = paused.block(Some(deadline), &waiter.signal).unwrap();
-    let dropped = paused.block(Some(deadline), &waiter.signal).unwrap();
+    let survivor = paused.register(Some(deadline), &waiter.signal).unwrap();
+    let dropped = paused.register(Some(deadline), &waiter.signal).unwrap();
 
     // Retiring the later registration leaves the earlier one listed and counted
     drop(dropped);
     assert_eq!(tester.next_deadline(), Some(deadline));
-    assert_eq!(blocked(&clock), 1);
+    assert_eq!(registered(&clock), 1);
     drop(survivor);
     assert_eq!(tester.next_deadline(), None);
-    assert_eq!(blocked(&clock), 0);
+    assert_eq!(registered(&clock), 0);
 }
 
 // Wall time follows the sum of the advances, without rounding each one.
@@ -608,7 +609,7 @@ fn test_next_deadline_drives_sleeps_in_order() {
             (deadline, thread::spawn(move || clock.sleep_until(deadline)))
         })
         .collect();
-    tester.wait_blocked(3);
+    tester.wait_registered(3);
     sleeps.sort_by_key(|(deadline, _)| *deadline);
 
     // Each advance wakes only the sleep it reaches, which returns before the next read
@@ -617,10 +618,10 @@ fn test_next_deadline_drives_sleeps_in_order() {
         assert_eq!(next, deadline, "{index}");
         tester.advance_to(next);
         sleep.join().unwrap();
-        assert_eq!(blocked(&clock), 2 - index, "{index}");
+        assert_eq!(registered(&clock), 2 - index, "{index}");
     }
     assert_eq!(tester.next_deadline(), None);
-    assert_eq!(blocked(&clock), 0);
+    assert_eq!(registered(&clock), 0);
 }
 
 // A real sleep lasts at least its duration, with no upper bound on how long.

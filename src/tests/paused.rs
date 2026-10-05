@@ -7,7 +7,7 @@
 //! Checks timer delivery, retention and receive precedence without real deadlines.
 
 use super::*;
-use crate::tests::helpers::blocked;
+use crate::tests::helpers::registered;
 use crossbeam_channel::{Select, bounded, select};
 use std::sync::mpsc;
 use std::thread;
@@ -270,10 +270,10 @@ fn test_wait_timers_counts_only_armed_timers() {
     assert!(tester.paused.lock().timers.is_empty());
 }
 
-// The next deadline is the earliest timer or parked wait, and fired timers leave it.
+// The next deadline is the earliest timer or registered wait, and fired timers leave it.
 #[test]
-fn test_next_deadline_combines_timers_and_parked_waits() {
-    // Park a sleep between two timer deadlines
+fn test_next_deadline_combines_timers_and_registered_waits() {
+    // Register a sleep between two timer deadlines
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let start = clock.now();
@@ -283,15 +283,15 @@ fn test_next_deadline_combines_timers_and_parked_waits() {
         let clock = clock.clone();
         move || clock.sleep_until(start + Duration::from_secs(2))
     });
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
     tester.wait_timers(2);
     assert_eq!(tester.next_deadline(), Some(start + Duration::from_secs(1)));
 
-    // Firing the first timer leaves the sleep parked, counted and listed
+    // Firing the first timer leaves the sleep registered, counted and listed
     tester.advance(Duration::from_secs(1));
     assert_eq!(first.try_recv(), Ok(start + Duration::from_secs(1)));
     assert!(!waiting.is_finished());
-    assert_eq!(blocked(&clock), 1);
+    assert_eq!(registered(&clock), 1);
     assert_eq!(tester.next_deadline(), Some(start + Duration::from_secs(2)));
 
     // Ending the sleep exposes the final timer, whose firing empties the deadlines
@@ -303,7 +303,7 @@ fn test_next_deadline_combines_timers_and_parked_waits() {
     assert_eq!(tester.next_deadline(), None);
 }
 
-// An advance wakes a select on a clock timer without counting it as a clock park.
+// An advance wakes a select on a clock timer without registering a clock wait.
 #[test]
 fn test_select_wakes_on_clock_timer() {
     // Create the timer on the selecting thread and observe its registration
@@ -320,7 +320,7 @@ fn test_select_wakes_on_clock_timer() {
         }
     });
     tester.wait_timers(1);
-    assert_eq!(blocked(&clock), 0);
+    assert_eq!(registered(&clock), 0);
 
     // Sending the timer message wakes the select with the published clock time
     tester.advance_to(deadline);
@@ -437,7 +437,7 @@ fn test_receive_gets_timer_at_equal_deadline() {
 #[test]
 fn test_receive_takes_rendezvous_message_that_reads_the_clock() {
     for relative in [false, true] {
-        // Park a select whose send arm reads the clock only when chosen, and wait until it waits
+        // Wait for a select whose send arm reads the clock only when chosen
         let tester = TestClock::new();
         let clock = tester.clock();
         let (sender, receiver) = bounded(0);
@@ -469,7 +469,7 @@ fn test_receive_takes_rendezvous_message_that_reads_the_clock() {
 // reads the clock, without deadlocking on the clock during its recheck.
 #[test]
 fn test_receive_recheck_takes_rendezvous_message_that_reads_the_clock() {
-    // Once the receive's timer wins, park a select whose send arm reads the clock only
+    // Once the receive's timer wins, start a select whose send arm reads the clock only
     // when chosen, and let the receive recheck only after it waits
     let mut tester = TestClock::new();
     let clock = tester.clock();
@@ -497,7 +497,7 @@ fn test_receive_recheck_takes_rendezvous_message_that_reads_the_clock() {
     });
     tester.wait_timers(1);
 
-    // The timeout wins at the deadline, and the recheck gets the parked sender's time
+    // The timeout wins at the deadline, and the recheck gets the waiting sender's time
     tester.advance_to(deadline);
     assert_eq!(waiting.join().unwrap(), Ok(deadline));
     sendings.recv().unwrap().join().unwrap();

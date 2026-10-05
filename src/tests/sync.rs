@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::TestClock;
-use crate::tests::helpers::{blocked, pause_before_park, pause_before_rewait, wakes};
+use crate::tests::helpers::{pause_before_rewait, pause_before_wait, registered, wakes};
 use std::sync::{self, Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -54,19 +54,19 @@ where
     waiting
 }
 
-/// Blocks until no thread is parked on the clock, catching a woken wait
+/// Blocks until no wait is registered on the clock, catching a woken wait
 /// before it relocks its mutex.
-fn wait_unblocked(clock: &Clock) {
+fn wait_unregistered(clock: &Clock) {
     let paused = clock.paused.as_ref().unwrap();
     let mut state = paused.state.lock().unwrap();
-    while state.blocked != 0 {
+    while state.registered != 0 {
         state = paused.changed.wait(state).unwrap();
     }
 }
 
-/// Holds the condvar's parked wait in its rewait hook, still counted and
+/// Holds the condvar's registered wait in its rewait hook, still counted and
 /// listed, until the returned sender resumes it.
-fn hold_park(clock: &Clock, condvar: &Condvar) -> mpsc::SyncSender<()> {
+fn hold_wait(clock: &Clock, condvar: &Condvar) -> mpsc::SyncSender<()> {
     // Wake the wait through std alone, which counts no notification, so it stops in the hook
     let (checked, resume) = pause_before_rewait(clock);
     {
@@ -206,12 +206,12 @@ fn test_wait_while_rechecks_predicate_after_notifications() {
         assert!(*guard);
     });
     assert!(!checks.recv().unwrap());
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
 
-    // A notification with the gate still closed leads to another check and park
+    // A notification with the gate still closed leads to another check and registration
     pair.1.notify_one();
     assert!(!checks.recv().unwrap());
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
 
     // Opening the gate under the mutex lets the next notification end the wait
     *pair.0.lock().unwrap() = true;
@@ -223,18 +223,18 @@ fn test_wait_while_rechecks_predicate_after_notifications() {
 // Advances never wake an untimed wait, which still ends on a notification.
 #[test]
 fn test_advances_never_wake_an_untimed_wait() {
-    // Park an untimed wait on a test clock
+    // Register an untimed wait on a test clock
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let pair = Arc::new((Mutex::new(()), Condvar::new(&clock)));
     let waiting = start_wait(&pair, |condvar, guard| drop(condvar.wait(guard).unwrap()));
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
 
     // Neither advance method wakes it, uncounts it or lists a deadline for it
     tester.advance(Duration::from_secs(30));
     tester.advance_to(clock.now() + Duration::from_secs(30));
     assert_eq!(wakes(&pair.1.waiter.signal), 0);
-    assert_eq!(blocked(&clock), 1);
+    assert_eq!(registered(&clock), 1);
     assert_eq!(tester.next_deadline(), None);
 
     // A notification still ends it
@@ -243,10 +243,10 @@ fn test_advances_never_wake_an_untimed_wait() {
 }
 
 // An advance wakes only the sleeps and deadline waits it reaches, leaving the
-// rest parked and listed.
+// rest registered and listed.
 #[test]
 fn test_advances_wake_only_the_waits_they_reach() {
-    // Park both sleep methods on one deadline
+    // Register both sleep methods on one deadline
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let start = clock.now();
@@ -263,9 +263,9 @@ fn test_advances_wake_only_the_waits_they_reach() {
             })
         })
         .collect();
-    tester.wait_blocked(2);
+    tester.wait_registered(2);
 
-    // Park a later deadline wait and an untimed wait, each on its own condvar
+    // Register a later deadline wait and an untimed wait, each on its own condvar
     let deadline = start + Duration::from_secs(5);
     let pair = Arc::new((Mutex::new(()), Condvar::new(&clock)));
     let waiting = start_wait(&pair, move |condvar, guard| {
@@ -275,16 +275,16 @@ fn test_advances_wake_only_the_waits_they_reach() {
     let untimed_thread = start_wait(&untimed, |condvar, guard| {
         drop(condvar.wait(guard).unwrap())
     });
-    tester.wait_blocked(4);
+    tester.wait_registered(4);
 
-    // An advance short of every deadline wakes nothing and leaves all four parked
+    // An advance short of every deadline wakes nothing and leaves all four registered
     tester.advance(Duration::from_secs(2));
     for sleep in &sleeps {
         assert!(!sleep.is_finished());
     }
     assert_eq!(wakes(&pair.1.waiter.signal), 0);
     assert_eq!(wakes(&untimed.1.waiter.signal), 0);
-    assert_eq!(blocked(&clock), 4);
+    assert_eq!(registered(&clock), 4);
     assert_eq!(tester.next_deadline(), Some(start + Duration::from_secs(3)));
 
     // Reaching the sleeps' deadline wakes just the sleeps
@@ -294,7 +294,7 @@ fn test_advances_wake_only_the_waits_they_reach() {
     }
     assert_eq!(wakes(&pair.1.waiter.signal), 0);
     assert_eq!(wakes(&untimed.1.waiter.signal), 0);
-    assert_eq!(blocked(&clock), 2);
+    assert_eq!(registered(&clock), 2);
     assert_eq!(tester.next_deadline(), Some(deadline));
 
     // Reaching the deadline wait's deadline times it out, leaving the untimed wait to a notification
@@ -304,7 +304,7 @@ fn test_advances_wake_only_the_waits_they_reach() {
     assert!(waiting.join().unwrap().timed_out());
     assert_eq!(clock.now(), deadline);
     assert_eq!(tester.next_deadline(), None);
-    assert_eq!(blocked(&clock), 1);
+    assert_eq!(registered(&clock), 1);
     untimed.1.notify_one();
     untimed_thread.join().unwrap();
 }
@@ -328,7 +328,7 @@ fn test_wait_deadline_returns_early_on_notification() {
     }
 }
 
-// Deadlines already reached return at once, timed out, without parking.
+// Deadlines already reached return at once, timed out, without registration.
 #[test]
 fn test_wait_deadline_returns_for_reached_deadlines() {
     // Move a test clock past a known instant, which is in the past for both clocks
@@ -347,18 +347,18 @@ fn test_wait_deadline_returns_for_reached_deadlines() {
             assert!(result.timed_out(), "{clock:?} {deadline:?}");
             assert_eq!(*guard, 7, "{clock:?} {deadline:?}");
         }
-        assert_eq!(condvar.waiter.signal.lock().parks, 0, "{clock:?}");
+        assert_eq!(condvar.waiter.signal.lock().waits, 0, "{clock:?}");
     }
 }
 
-// An advance to the deadline before the first park ends the wait, with no overshoot.
+// An advance to the deadline before registration ends the wait without overshooting.
 #[test]
-fn test_wait_deadline_observes_advance_before_parking() {
-    // Stop a wait after it takes the caller's deadline, before it can park
+fn test_wait_deadline_observes_advance_before_registration() {
+    // Stop a wait after it takes the caller's deadline and before it registers
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let deadline = clock.now() + Duration::from_secs(5);
-    let (checked, resume) = pause_before_park(&clock);
+    let (checked, resume) = pause_before_wait(&clock);
     let waiting = thread::spawn({
         let clock = clock.clone();
         move || {
@@ -372,7 +372,7 @@ fn test_wait_deadline_observes_advance_before_parking() {
     });
     assert_eq!(checked.recv().unwrap(), None);
 
-    // Advance exactly to the deadline while nothing is parked
+    // Advance exactly to the deadline while nothing is registered
     assert_eq!(tester.next_deadline(), None);
     tester.advance_to(deadline);
     resume.send(()).unwrap();
@@ -408,14 +408,14 @@ fn test_deadline_worker_recomputes_earliest_deadline() {
         }
     });
     assert_eq!(picks.recv().unwrap(), later);
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
     assert_eq!(tester.next_deadline(), Some(later));
 
     // Publish an earlier deadline under the mutex and notify the worker
     pair.0.lock().unwrap().push(earlier);
     pair.1.notify_one();
     assert_eq!(picks.recv().unwrap(), earlier);
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
     assert_eq!(tester.next_deadline(), Some(earlier));
 
     // Advancing to the new deadline alone ends the worker
@@ -424,14 +424,14 @@ fn test_deadline_worker_recomputes_earliest_deadline() {
     assert_eq!(tester.next_deadline(), None);
 }
 
-// A notification between the caller's check and the park is not lost.
+// A notification between the caller's check and registration is not lost.
 #[test]
-fn test_notification_between_predicate_and_park_is_observed() {
-    // Stop the first wait after its predicate runs, before it parks
+fn test_notification_between_predicate_and_registration_is_observed() {
+    // Stop the first wait after its predicate runs and before it registers
     let tester = TestClock::new();
     let clock = tester.clock();
     let pair = Arc::new((Mutex::new(()), Condvar::new(&clock)));
-    let (checked, resume) = pause_before_park(&clock);
+    let (checked, resume) = pause_before_wait(&clock);
     let waiting = thread::spawn({
         let pair = pair.clone();
         move || {
@@ -454,16 +454,16 @@ fn test_notification_between_predicate_and_park_is_observed() {
     pair.1.notify_one();
     resume.send(()).unwrap();
 
-    // The wait returns without parking, and the predicate runs again
+    // The wait returns without registering, and the predicate runs again
     assert_eq!(waiting.join().unwrap(), 2);
-    assert_eq!(pair.1.waiter.signal.lock().parks, 0);
+    assert_eq!(pair.1.waiter.signal.lock().waits, 0);
 }
 
 // Waits return their guard inside an error when the mutex was poisoned meanwhile.
 #[test]
 fn test_wait_relocks_poisoned_mutex() {
     for timed in [false, true] {
-        // Park a wait on a healthy mutex
+        // Register a wait on a healthy mutex
         let tester = TestClock::new();
         let deadline = tester.clock().now() + Duration::from_secs(5);
         let pair = Arc::new((Mutex::new(7), Condvar::new(&tester.clock())));
@@ -479,7 +479,7 @@ fn test_wait_relocks_poisoned_mutex() {
                 *condvar.wait(guard).unwrap_err().into_inner()
             }
         });
-        tester.wait_blocked(1);
+        tester.wait_registered(1);
 
         // Poison the mutex while the wait has it released, then notify the wait
         poison(|| pair.0.lock().unwrap());
@@ -495,7 +495,7 @@ fn test_wait_relocks_poisoned_mutex() {
 // A notified wait does not time out, even when it relocks after its deadline.
 #[test]
 fn test_notified_wait_does_not_time_out_on_late_relock() {
-    // Park a timed wait
+    // Register a timed wait
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let deadline = clock.now() + Duration::from_secs(5);
@@ -503,12 +503,12 @@ fn test_notified_wait_does_not_time_out_on_late_relock() {
     let waiting = start_wait(&pair, move |condvar, guard| {
         condvar.wait_deadline(guard, deadline).unwrap().1
     });
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
 
     // Notify it while holding the mutex, so it wakes and then waits to relock
     let guard = pair.0.lock().unwrap();
     pair.1.notify_one();
-    wait_unblocked(&clock);
+    wait_unregistered(&clock);
     assert_eq!(tester.next_deadline(), None);
 
     // Reach the deadline before the relock, which must not turn the notification into a timeout
@@ -520,7 +520,7 @@ fn test_notified_wait_does_not_time_out_on_late_relock() {
 // A notification consumed by another wait cannot release a held wait at its deadline.
 #[test]
 fn test_consumed_notification_leaves_sibling_to_time_out() {
-    // Hold one timed wait in its park, so that only the next wait can take the notification
+    // Hold one registered timed wait so that the next wait takes the notification
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let deadline = clock.now() + Duration::from_secs(5);
@@ -528,17 +528,17 @@ fn test_consumed_notification_leaves_sibling_to_time_out() {
     let later = start_wait(&pair, move |condvar, guard| {
         condvar.wait_deadline(guard, deadline).unwrap().1
     });
-    tester.wait_blocked(1);
-    let resume = hold_park(&clock, &pair.1);
+    tester.wait_registered(1);
+    let resume = hold_wait(&clock, &pair.1);
 
     // A second timed wait takes the only single notification
     let first = start_wait(&pair, move |condvar, guard| {
         condvar.wait_deadline(guard, deadline).unwrap().1
     });
-    tester.wait_blocked(2);
+    tester.wait_registered(2);
     pair.1.notify_one();
     assert!(!first.join().unwrap().timed_out());
-    assert_eq!(blocked(&clock), 1);
+    assert_eq!(registered(&clock), 1);
     assert_eq!(tester.next_deadline(), Some(deadline));
 
     // Reaching the deadline before resuming the held wait reports a timeout
@@ -555,10 +555,10 @@ fn test_consumed_notification_leaves_sibling_to_time_out() {
     assert_eq!(tester.next_deadline(), None);
 }
 
-// A consumed single notification leaves an unreached sibling parked through an advance.
+// A consumed single notification leaves an unreached sibling registered through an advance.
 #[test]
 fn test_consumed_notification_keeps_unreached_sibling_listed() {
-    // Park two waits that repeat at an earlier deadline only if notified
+    // Register two waits that repeat at an earlier deadline only if notified
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let earlier = clock.now() + Duration::from_secs(1);
@@ -578,10 +578,10 @@ fn test_consumed_notification_keeps_unreached_sibling_listed() {
             })
         })
         .collect();
-    tester.wait_blocked(2);
+    tester.wait_registered(2);
     pair.1.notify_one();
     assert_eq!(reports.recv().unwrap(), Some(false));
-    tester.wait_blocked(2);
+    tester.wait_registered(2);
 
     // Report the sibling's rewait on the same channel as returns, so an early return fails
     *clock.paused.as_ref().unwrap().before_rewait.lock().unwrap() = Some(Box::new(move |_| {
@@ -591,7 +591,7 @@ fn test_consumed_notification_keeps_unreached_sibling_listed() {
     let events = [reports.recv().unwrap(), reports.recv().unwrap()];
     assert!(events.contains(&None));
     assert!(events.contains(&Some(true)));
-    assert_eq!(blocked(&clock), 1);
+    assert_eq!(registered(&clock), 1);
     assert_eq!(tester.next_deadline(), Some(later));
 
     // The sibling times out only when its own deadline is reached
@@ -616,8 +616,8 @@ fn test_broadcast_followed_by_single_notification_strands_nothing() {
         let first = start_wait(&pair, move |condvar, guard| {
             condvar.wait_deadline(guard, deadline).unwrap().1
         });
-        tester.wait_blocked(1);
-        let resume = hold_park(&clock, &pair.1);
+        tester.wait_registered(1);
+        let resume = hold_wait(&clock, &pair.1);
         if pending {
             pair.1.notify_one();
         }
@@ -635,7 +635,7 @@ fn test_broadcast_followed_by_single_notification_strands_nothing() {
         let next = start_wait(&pair, move |condvar, guard| {
             condvar.wait_deadline(guard, deadline).unwrap().1
         });
-        tester.wait_blocked(2);
+        tester.wait_registered(2);
         resume.send(()).unwrap();
         assert!(!first.join().unwrap().timed_out(), "{pending}");
         assert_eq!(pair.1.waiter.signal.lock().waiting, 1, "{pending}");
@@ -664,8 +664,8 @@ fn test_single_notification_releases_exactly_one_reached_wait() {
         waits.push(start_wait(&pair, move |condvar, guard| {
             condvar.wait_deadline(guard, deadline).unwrap().1
         }));
-        tester.wait_blocked(count);
-        resumes.push(hold_park(&clock, &pair.1));
+        tester.wait_registered(count);
+        resumes.push(hold_wait(&clock, &pair.1));
     }
 
     // Reach both deadlines with one notification waiting to be claimed
@@ -696,8 +696,8 @@ fn test_later_wait_cannot_claim_earlier_notification() {
     let first = start_wait(&pair, move |condvar, guard| {
         condvar.wait_deadline(guard, deadline).unwrap().1
     });
-    tester.wait_blocked(1);
-    let resume = hold_park(&clock, &pair.1);
+    tester.wait_registered(1);
+    let resume = hold_wait(&clock, &pair.1);
     pair.1.notify_one();
     pair.1.notify_one();
     assert_eq!(pair.1.waiter.signal.lock().pending.len(), 1);
@@ -726,16 +726,16 @@ fn test_wait_claims_oldest_eligible_notification() {
     let first = start_wait(&pair, move |condvar, guard| {
         condvar.wait_deadline(guard, deadline).unwrap().1
     });
-    tester.wait_blocked(1);
-    let first_resume = hold_park(&clock, &pair.1);
+    tester.wait_registered(1);
+    let first_resume = hold_wait(&clock, &pair.1);
     pair.1.notify_one();
 
     // Start a later wait that can claim only the second notification
     let second = start_wait(&pair, move |condvar, guard| {
         condvar.wait_deadline(guard, deadline).unwrap().1
     });
-    tester.wait_blocked(2);
-    let second_resume = hold_park(&clock, &pair.1);
+    tester.wait_registered(2);
+    let second_resume = hold_wait(&clock, &pair.1);
     pair.1.notify_one();
     first_resume.send(()).unwrap();
     assert!(!first.join().unwrap().timed_out());
@@ -749,9 +749,9 @@ fn test_wait_claims_oldest_eligible_notification() {
     assert!(state.pending.is_empty());
 }
 
-// A reached park stays listed at the current time until its thread retires it.
+// A reached registration stays listed at the current time until its thread removes it.
 #[test]
-fn test_next_deadline_clamps_reached_park_to_current_time() {
+fn test_next_deadline_clamps_reached_registration_to_current_time() {
     // Hold a listed timed wait so an advance cannot retire it
     let mut tester = TestClock::new();
     let clock = tester.clock();
@@ -760,15 +760,15 @@ fn test_next_deadline_clamps_reached_park_to_current_time() {
     let waiting = start_wait(&pair, move |condvar, guard| {
         condvar.wait_deadline(guard, deadline).unwrap().1
     });
-    tester.wait_blocked(1);
-    let resume = hold_park(&clock, &pair.1);
+    tester.wait_registered(1);
+    let resume = hold_wait(&clock, &pair.1);
 
     // Overshooting returns the current time, which accepts a no-op advance
     tester.advance(Duration::from_secs(2));
     let next = tester.next_deadline().unwrap();
     assert_eq!(next, clock.now());
     tester.advance_to(next);
-    assert_eq!(blocked(&clock), 1);
+    assert_eq!(registered(&clock), 1);
 
     // Retirement removes the reached deadline after reporting a timeout
     resume.send(()).unwrap();
@@ -776,11 +776,10 @@ fn test_next_deadline_clamps_reached_park_to_current_time() {
     assert_eq!(tester.next_deadline(), None);
 }
 
-// Reaching one wait's deadline on a condvar keeps a later wait on it counted
-// and listed within its park.
+// Reaching one wait's deadline on a condvar keeps a later wait registered and listed.
 #[test]
 fn test_later_wait_on_a_reached_condvar_stays_listed() {
-    // Hold the later wait in its park, then park an earlier one on the same condvar
+    // Hold the later registered wait, then register an earlier one on the same condvar
     let mut tester = TestClock::new();
     let clock = tester.clock();
     let earlier = clock.now() + Duration::from_secs(1);
@@ -789,25 +788,25 @@ fn test_later_wait_on_a_reached_condvar_stays_listed() {
     let last = start_wait(&pair, move |condvar, guard| {
         condvar.wait_deadline(guard, later).unwrap().1
     });
-    tester.wait_blocked(1);
-    let resume = hold_park(&clock, &pair.1);
+    tester.wait_registered(1);
+    let resume = hold_wait(&clock, &pair.1);
     let first = start_wait(&pair, move |condvar, guard| {
         condvar.wait_deadline(guard, earlier).unwrap().1
     });
-    tester.wait_blocked(2);
+    tester.wait_registered(2);
 
     // Reaching the earlier deadline ends that wait and leaves the later one listed
     tester.advance_to(earlier);
     assert!(first.join().unwrap().timed_out());
     assert_eq!(tester.next_deadline(), Some(later));
-    assert_eq!(blocked(&clock), 1);
+    assert_eq!(registered(&clock), 1);
 
-    // Resumed, the later wait waits again within its park, so it is still counted then
+    // The resumed wait repeats within its registration and remains counted
     let paused = clock.paused.as_ref().unwrap();
     let (checked, checks) = mpsc::channel();
-    for hook in [&paused.before_park, &paused.before_rewait] {
+    for hook in [&paused.before_wait, &paused.before_rewait] {
         let (clock, checked) = (clock.clone(), checked.clone());
-        *hook.lock().unwrap() = Some(Box::new(move |_| checked.send(blocked(&clock)).unwrap()));
+        *hook.lock().unwrap() = Some(Box::new(move |_| checked.send(registered(&clock)).unwrap()));
     }
     resume.send(()).unwrap();
     assert_eq!(checks.recv().unwrap(), 1);
@@ -816,7 +815,7 @@ fn test_later_wait_on_a_reached_condvar_stays_listed() {
     tester.advance_to(later);
     assert!(last.join().unwrap().timed_out());
     assert_eq!(tester.next_deadline(), None);
-    assert_eq!(blocked(&clock), 0);
+    assert_eq!(registered(&clock), 0);
 }
 
 // One advance ends every wait it reaches on a condvar, whether their deadlines
@@ -824,7 +823,7 @@ fn test_later_wait_on_a_reached_condvar_stays_listed() {
 #[test]
 fn test_advance_ends_every_reached_wait_on_a_condvar() {
     for same_deadline in [false, true] {
-        // Park two deadline waits on one condvar, at one deadline or at two
+        // Register two timed waits on one condvar, at one deadline or at two
         let mut tester = TestClock::new();
         let clock = tester.clock();
         let earlier = clock.now() + Duration::from_secs(1);
@@ -838,14 +837,14 @@ fn test_advance_ends_every_reached_wait_on_a_condvar() {
                 })
             })
             .collect();
-        tester.wait_blocked(2);
+        tester.wait_registered(2);
 
         // Advancing to the later deadline times out both and unlists them
         tester.advance_to(later);
         for wait in waits {
             assert!(wait.join().unwrap().timed_out(), "{same_deadline}");
         }
-        assert_eq!(blocked(&clock), 0, "{same_deadline}");
+        assert_eq!(registered(&clock), 0, "{same_deadline}");
         assert_eq!(tester.next_deadline(), None, "{same_deadline}");
     }
 }
@@ -870,7 +869,7 @@ fn test_advance_deduplicates_nonadjacent_signal_deadlines() {
             })
         })
         .collect();
-    tester.wait_blocked(3);
+    tester.wait_registered(3);
 
     // One advance must wake both condvars exactly once while reaching all three waits
     tester.advance(Duration::from_secs(3));
@@ -882,10 +881,10 @@ fn test_advance_deduplicates_nonadjacent_signal_deadlines() {
     assert_eq!(tester.next_deadline(), None);
 }
 
-// Parked sleeps and deadline waits, never untimed waits, list their deadlines
+// Registered sleeps and deadline waits, never untimed waits, list their deadlines
 // until they stop waiting.
 #[test]
-fn test_next_deadline_tracks_only_parked_timed_waits() {
+fn test_next_deadline_tracks_only_registered_timed_waits() {
     // An untimed wait lists no deadline
     let mut tester = TestClock::new();
     let clock = tester.clock();
@@ -895,10 +894,10 @@ fn test_next_deadline_tracks_only_parked_timed_waits() {
     let untimed_thread = start_wait(&untimed, |condvar, guard| {
         drop(condvar.wait(guard).unwrap())
     });
-    tester.wait_blocked(1);
+    tester.wait_registered(1);
     assert_eq!(tester.next_deadline(), None);
 
-    // Park both sleeps and two deadline waits, one sharing its deadline with a sleep
+    // Register both sleeps and two timed waits, one sharing its deadline with a sleep
     let sleep_thread = thread::spawn({
         let clock = clock.clone();
         move || clock.sleep(Duration::from_secs(3))
@@ -918,7 +917,7 @@ fn test_next_deadline_tracks_only_parked_timed_waits() {
             (pair, waiting)
         })
         .collect();
-    tester.wait_blocked(5);
+    tester.wait_registered(5);
     assert_eq!(tester.next_deadline(), Some(start + Duration::from_secs(1)));
 
     // Ending the earliest wait exposes the deadline its sibling shares with a sleep
@@ -942,7 +941,7 @@ fn test_next_deadline_tracks_only_parked_timed_waits() {
     tester.advance(Duration::from_secs(3));
     sleep_thread.join().unwrap();
     assert!(!until_thread.is_finished());
-    assert_eq!(blocked(&clock), 1);
+    assert_eq!(registered(&clock), 1);
     assert_eq!(tester.next_deadline(), Some(start + Duration::from_secs(7)));
 
     // Ending the last sleep leaves no deadline behind
