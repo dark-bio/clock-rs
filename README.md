@@ -17,10 +17,10 @@ Reading a clock, sleeping on it and waiting on its condvars work in every build.
 
 ```toml
 [dependencies]
-darkbio-clock = "0.3"
+darkbio-clock = "0.4"
 
 [dev-dependencies]
-darkbio-clock = { version = "0.3", features = ["test-clock"] }
+darkbio-clock = { version = "0.4", features = ["test-clock"] }
 ```
 
 ```rust
@@ -33,13 +33,13 @@ let mut tester = TestClock::new();
 let clock = tester.clock();
 let sleeper = thread::spawn(move || clock.sleep(Duration::from_secs(5)));
 
-tester.wait_blocked(1);
+tester.wait_registered(1);
 tester.advance(Duration::from_secs(5));
 sleeper.join().unwrap();
 # }
 ```
 
-The sleeper parks on the test clock, `wait_blocked` returns once it has, and the advance releases it without any real waiting.
+The sleeper registers its wait on the test clock, `wait_registered` returns once it has, and the advance releases it without any real waiting.
 
 ## Replacing std and crossbeam calls
 
@@ -91,21 +91,27 @@ A test clock starts at the real monotonic and wall times, so until a test moves 
 
 An advance jumps straight to its target. Where every period matters, advance one period and wait for its effect before the next. A test clock never moves by itself, so a deadline nobody advances to never passes, and the test hangs. `cargo test` never stops a hung test, so run tests under a runner that does, such as cargo-nextest with `slow-timeout = { period = "60s", terminate-after = 2 }`.
 
-Dropping the `TestClock` stops all advances. Its parked sleeps then never end, its condvar waits end only when notified, and its unfired timers never fire while a `Clock` handle lives. Once the last handle is gone too, those timers disconnect, and a `select!` on one sees that arm ready with an error. So advance past their deadlines before dropping the `TestClock`.
+Dropping the `TestClock` stops all advances. Sleeps still waiting then never end, condvar waits end only when notified, and unfired timers never fire while a `Clock` handle lives. Once the last handle is gone too, those timers disconnect, and a `select!` on one sees that arm ready with an error. So advance past their deadlines before dropping the `TestClock`.
 
 ### Waiting for threads
 
 An advance returns once the sleeps and deadline waits it reaches are woken and its due timers hold their messages, not once any thread has acted. Wait for the effect itself, such as a result or a message, before checking it.
 
-An advance wakes only the waits whose deadlines it reaches, and never counts as a notification. Every other wait keeps waiting until it is notified or reached, still counted by `wait_blocked` and, if it has a deadline, listed by `next_deadline`.
+An advance wakes only the waits whose deadlines it reaches, and never counts as a notification. Every other wait keeps waiting until it is notified or reached.
 
-`wait_blocked(n)` returns once at least `n` threads are parked in the clock's sleeps and condvar waits, timed or not. Threads blocked in a crossbeam receive or `select!` are invisible to it, so with `crossbeam`, `wait_timers(n)` waits for at least `n` armed timers instead, counting those of waiting receives. An earlier park or timer counts too, so neither count proves progress on its own.
+`wait_registered(n)` returns once at least `n` clock sleeps or condvar waits are registered, timed or not. A wait stays registered from the moment it starts waiting until it returns. So the count includes a thread that a notification or an advance has woken but that has not run yet. An earlier registration counts too, so the count proves no progress on its own.
 
-`next_deadline()` returns the earliest deadline among the clock's parked sleeps, deadline waits and unfired timers, and advancing to it runs a test to its next timeout. A wait stays listed until it stops waiting, so one an advance reached stays listed until its thread runs, and is reported at the current time. Await an advance's effect before reading the next deadline.
+`wait_parked(n)` returns once at least `n` registered waits are parked, with their deadlines unreached or absent, and no notification on this clock is outstanding. A notification stays outstanding until every wait it ended has returned. So a woken thread that has not run yet holds the barrier, on whichever condvar of the clock it waits.
+
+Use `wait_parked` before moving time or reading a worker's deadline. Its count must cover every worker the test expects to park, and the test must control the work they receive. A worker that exits never counts again. Neither wait has a timeout of its own, so rely on the runner's timeout above.
+
+Neither wait sees a thread blocked in a crossbeam receive, a `select!` or a mutex, or a thread busy outside clock waits. So with `crossbeam`, `wait_timers(n)` waits for at least `n` armed timers instead, counting those of waiting receives. A timer armed earlier counts too, so the count proves no progress on its own.
+
+`next_deadline()` returns the earliest deadline among the clock's registered waits and unfired timers, and advancing to it runs a test to its next timeout. A wait an advance has reached stays registered until its thread runs, and is reported at the current time, so advancing to the result stays valid. Await an advance's effect before reading the next deadline, for example with `wait_parked`. A `None` means no deadline is registered at that moment, since a running worker may still register one.
 
 ### Deadlines
 
-A sleep takes its deadline when it is called, so a sleep that starts after an advance waits for a later time. Wait with `wait_blocked` before advancing, or take the deadline first and use `sleep_until`.
+A sleep takes its deadline when it is called, so a sleep that starts after an advance waits for a later time. Wait with `wait_registered` before advancing, since a sleep fixes its deadline when it registers, or take the deadline first and use `sleep_until`.
 
 Take deadlines from the handle's own clock. An `Instant` does not record its clock, so a deadline from `Instant::now()` is silently read as test time. Only calls through the clock follow it, and std's and crossbeam's own time reads, sleeps, timeouts and timers stay on real time, which the lint below flags.
 

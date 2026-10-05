@@ -12,9 +12,16 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Returns the number of threads parked on a test clock.
-pub(crate) fn blocked(clock: &Clock) -> usize {
-    clock.paused.as_ref().unwrap().state.lock().unwrap().blocked
+/// Returns the number of registered waits on a test clock.
+pub(crate) fn registered(clock: &Clock) -> usize {
+    clock
+        .paused
+        .as_ref()
+        .unwrap()
+        .state
+        .lock()
+        .unwrap()
+        .registered
 }
 
 /// Returns how many times advances woke a signal.
@@ -22,12 +29,12 @@ pub(crate) fn wakes(signal: &Signal) -> usize {
     signal.wakes.load(Ordering::SeqCst)
 }
 
-/// Stops the next wait before it parks, and reports its real timer.
-pub(crate) fn pause_before_park(clock: &Clock) -> (Receiver<Option<Instant>>, SyncSender<()>) {
-    pause(&clock.paused.as_ref().unwrap().before_park)
+/// Stops the next wait before it registers and reports its real timer.
+pub(crate) fn pause_before_wait(clock: &Clock) -> (Receiver<Option<Instant>>, SyncSender<()>) {
+    pause(&clock.paused.as_ref().unwrap().before_wait)
 }
 
-/// Stops the next park that waits again after a spurious wakeup, and reports
+/// Stops the next registered wait after a spurious wakeup and reports
 /// its real timer.
 pub(crate) fn pause_before_rewait(clock: &Clock) -> (Receiver<Option<Instant>>, SyncSender<()>) {
     pause(&clock.paused.as_ref().unwrap().before_rewait)
@@ -35,12 +42,12 @@ pub(crate) fn pause_before_rewait(clock: &Clock) -> (Receiver<Option<Instant>>, 
 
 /// Installs a one-shot hook that reports a wait's timer and holds the wait
 /// until resumed.
-fn pause(hook: &Mutex<Option<paused::BeforePark>>) -> (Receiver<Option<Instant>>, SyncSender<()>) {
+fn pause(hook: &Mutex<Option<paused::BeforeWait>>) -> (Receiver<Option<Instant>>, SyncSender<()>) {
     // Report the timer on one channel, and hold the wait until the other one fires
     let (checked, checks) = mpsc::sync_channel(0);
     let (resume, resumed) = mpsc::sync_channel(0);
 
-    // Stop exactly one wait, reporting the timer that its park will use
+    // Stop exactly one wait, reporting the timer it will use
     *hook.lock().unwrap() = Some(Box::new(move |timer| {
         checked.send(timer).unwrap();
         resumed.recv().unwrap();

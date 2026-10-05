@@ -35,7 +35,7 @@
 //!         }
 //!         true
 //!     });
-//!     tester.wait_blocked(1);
+//!     tester.wait_registered(1);
 //!     tester.advance(Duration::from_secs(5));
 //!     assert!(!worker.join().unwrap());
 //! });
@@ -210,7 +210,7 @@ impl<T: ?Sized + fmt::Display> fmt::Display for MutexGuard<'_, T> {
 /// Unlike std's, a wait that starts while its thread unwinds from a panic, on
 /// a guard taken before the panic, poisons the mutex as it releases it.
 pub struct Condvar {
-    /// Parks and wakes this condvar's waits, timing them on its clock.
+    /// Registers and wakes this condvar's waits, timing them on its clock.
     waiter: Waiter,
 }
 
@@ -310,11 +310,11 @@ impl Condvar {
             state = self.waiter.signal.lock();
         }
 
-        // Release the caller's mutex, keeping the signal locked until the park
+        // Release the caller's mutex, keeping the signal locked until the wait
         drop(inner);
 
-        // Park until notified or the deadline passes, and note which while the signal is locked
-        let (state, notified) = self.waiter.park(state, start, deadline);
+        // Wait until notified or the deadline passes, noting which under the signal lock
+        let (state, notified) = self.waiter.wait_locked(state, start, deadline);
 
         // Unlock the signal first, since notifiers take the two locks the other way round
         drop(state);

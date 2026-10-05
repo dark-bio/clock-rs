@@ -16,6 +16,8 @@
 mod clock;
 #[cfg(not(loom))]
 pub(crate) mod helpers;
+#[cfg(not(loom))]
+mod settlement;
 
 // Loom checks the wait core under every schedule, and proptest checks the timer
 // bookkeeping against a reference model

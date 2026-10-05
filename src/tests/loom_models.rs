@@ -17,8 +17,8 @@ use loom::thread;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-/// Holds a listed park outside its signal lock before its next notification check.
-fn hold_park(clock: &Clock, waiter: &Waiter) -> mpsc::Sender<()> {
+/// Holds a registered wait outside its signal lock before its next notification check.
+fn hold_wait(clock: &Clock, waiter: &Waiter) -> mpsc::Sender<()> {
     // Use modeled channels to hold the rewait without imposing a real schedule
     let (checked, checks) = mpsc::channel();
     let (resume, resumed) = mpsc::channel();
@@ -33,12 +33,13 @@ fn hold_park(clock: &Clock, waiter: &Waiter) -> mpsc::Sender<()> {
     resume
 }
 
-/// Checks that completed waits leave no parks or deadlines.
+/// Checks that completed waits leave no registrations, deadlines or notifications.
 fn assert_idle(tester: &TestClock, clock: &Clock) {
     // Read the public deadline before inspecting the remaining bookkeeping
     assert_eq!(tester.next_deadline(), None);
     let state = clock.paused.as_ref().unwrap().state.lock().unwrap();
-    assert_eq!(state.blocked, 0);
+    assert_eq!(state.registered, 0);
+    assert!(state.parked(0));
 }
 
 /// Checks a condition published under the caller's mutex with either notification order.
@@ -86,10 +87,10 @@ fn test_wait_observes_notification_after_unlock() {
     notification_model(false);
 }
 
-/// Checks that one broadcast or two single notifications release two parked waiters.
+/// Checks that one broadcast or two single notifications release two registered waits.
 fn two_waiters_model(broadcast: bool) {
     loom::model(move || {
-        // Park two waiters on one condvar before any notification can arrive
+        // Register two waits on one condvar before any notification can arrive
         let tester = TestClock::new();
         let clock = tester.clock();
         let pair = Arc::new((Mutex::new(false), Condvar::new(&clock)));
@@ -102,7 +103,7 @@ fn two_waiters_model(broadcast: bool) {
                 })
             })
             .collect();
-        tester.wait_blocked(2);
+        tester.wait_registered(2);
 
         // Publish one condition and wake both waiters through the selected operation
         *pair.0.lock().unwrap() = true;
@@ -134,7 +135,7 @@ fn test_notify_all_releases_two_waiters() {
     two_waiters_model(true);
 }
 
-// A deadline wait expires at its exact deadline regardless of when it parks.
+// A deadline wait expires at its exact deadline regardless of when it registers.
 #[test]
 fn test_wait_deadline_observes_exact_advance() {
     loom::model(|| {
@@ -157,7 +158,7 @@ fn test_wait_deadline_observes_exact_advance() {
             }
         });
 
-        // Reaching the deadline must suffice even when it precedes the park
+        // Reaching the deadline must suffice even when it precedes registration
         tester.advance_to(deadline);
         waiting.join().unwrap();
         assert_idle(&tester, &clock);
@@ -168,7 +169,7 @@ fn test_wait_deadline_observes_exact_advance() {
 #[test]
 fn test_wait_deadline_observes_notification_after_short_advance() {
     loom::model(|| {
-        // Park a timed wait whose condition the driver has not set
+        // Register a timed wait whose condition the driver has not set
         let mut tester = TestClock::new();
         let clock = tester.clock();
         let start = clock.now();
@@ -185,7 +186,7 @@ fn test_wait_deadline_observes_notification_after_short_advance() {
                 assert!(*ready);
             }
         });
-        tester.wait_blocked(1);
+        tester.wait_registered(1);
 
         // Advance short of the deadline before publishing and notifying the condition
         tester.advance(Duration::from_secs(1));
@@ -200,7 +201,7 @@ fn test_wait_deadline_observes_notification_after_short_advance() {
     });
 }
 
-// Sleeping until a fixed deadline observes an advance before or after parking.
+// Sleeping until a fixed deadline observes an advance before or after registration.
 #[test]
 fn test_sleep_until_observes_exact_advance() {
     loom::model(|| {
@@ -223,11 +224,11 @@ fn test_sleep_until_observes_exact_advance() {
     });
 }
 
-// A driver that observes a parked sleeper sees its deadline and can release it.
+// A driver that observes a registered sleeper sees its deadline and can release it.
 #[test]
-fn test_wait_blocked_exposes_sleep_deadline() {
+fn test_wait_registered_exposes_sleep_deadline() {
     loom::model(|| {
-        // Race the driver's blocked-count wait against the sleeper's registration
+        // Race the driver's count check against the sleeper's registration
         let mut tester = TestClock::new();
         let clock = tester.clock();
         let deadline = clock.now() + Duration::from_secs(1);
@@ -239,8 +240,8 @@ fn test_wait_blocked_exposes_sleep_deadline() {
             }
         });
 
-        // Observing a park guarantees its deadline is visible and its wakeup reaches it
-        tester.wait_blocked(1);
+        // Observing a registration guarantees its deadline is visible and its wakeup reaches it
+        tester.wait_registered(1);
         assert_eq!(tester.next_deadline(), Some(deadline));
         tester.advance_to(deadline);
         sleeper.join().unwrap();
@@ -252,7 +253,7 @@ fn test_wait_blocked_exposes_sleep_deadline() {
 #[test]
 fn test_notify_all_races_advance_with_mixed_waiters() {
     loom::model(|| {
-        // Park two waiters on separate conditions, so the untimed one can notify
+        // Register two waits on separate conditions, so the untimed one can notify
         let mut tester = TestClock::new();
         let clock = tester.clock();
         let deadline = clock.now() + Duration::from_secs(1);
@@ -291,7 +292,7 @@ fn test_notify_all_races_advance_with_mixed_waiters() {
                 pair.1.notify_all();
             }
         });
-        tester.wait_blocked(2);
+        tester.wait_registered(2);
 
         // Release the untimed notifier and race its broadcast against the advance
         pair.0.lock().unwrap().0 = true;
@@ -307,7 +308,7 @@ fn test_notify_all_races_advance_with_mixed_waiters() {
 }
 
 // A partial advance never ends a sleep, whether it lands before or after the
-// sleep registers, and the parked sleep stays listed at its own deadline.
+// sleep registers, and the registered sleep stays listed at its own deadline.
 #[test]
 fn test_partial_advance_leaves_sleep_listed() {
     loom::model(|| {
@@ -324,8 +325,8 @@ fn test_partial_advance_leaves_sleep_listed() {
         });
         tester.advance(Duration::from_secs(1));
 
-        // Once parked, the sleep is listed at its deadline, and only reaching it ends it
-        tester.wait_blocked(1);
+        // Once registered, the sleep is listed at its deadline, and reaching it ends it
+        tester.wait_registered(1);
         assert_eq!(tester.next_deadline(), Some(deadline));
         tester.advance_to(deadline);
         sleeper.join().unwrap();
@@ -334,7 +335,7 @@ fn test_partial_advance_leaves_sleep_listed() {
 }
 
 // Reaching one deadline wait on a condvar keeps a later wait on the same condvar
-// parked and listed, however the waits' registrations race the advance.
+// registered and listed, however the waits' registrations race the advance.
 #[test]
 fn test_reached_wait_keeps_later_wait_on_condvar_listed() {
     loom::model(|| {
@@ -359,10 +360,10 @@ fn test_reached_wait_keeps_later_wait_on_condvar_listed() {
             .collect();
         let mut waits = waits.into_iter();
 
-        // Reaching the earlier deadline ends that wait, and the later one parks listed
+        // Reaching the earlier deadline ends that wait while the later one registers
         tester.advance_to(earlier);
         waits.next().unwrap().join().unwrap();
-        tester.wait_blocked(1);
+        tester.wait_registered(1);
         assert_eq!(tester.next_deadline(), Some(later));
 
         // Reaching the later deadline ends it too
@@ -373,11 +374,11 @@ fn test_reached_wait_keeps_later_wait_on_condvar_listed() {
     });
 }
 
-// A broadcast racing a reached deadline releases a still-parked untimed wait.
+// A broadcast racing a reached deadline releases a registered untimed wait.
 #[test]
 fn test_notification_survives_advance_with_mixed_waiters() {
     loom::model(|| {
-        // Park a timed and an untimed wait on one condvar before either wake can arrive
+        // Register timed and untimed waits on one condvar before either wake can arrive
         let mut tester = TestClock::new();
         let clock = tester.clock();
         let deadline = clock.now() + Duration::from_secs(1);
@@ -403,7 +404,7 @@ fn test_notification_survives_advance_with_mixed_waiters() {
                 assert!(*ready.unwrap());
             }
         });
-        tester.wait_blocked(2);
+        tester.wait_registered(2);
 
         // Race the first notification with the advance while both waits still count
         let notifying = thread::spawn({
@@ -428,7 +429,7 @@ fn test_notification_survives_advance_with_mixed_waiters() {
 #[test]
 fn test_consumed_notification_keeps_unreached_sibling_listed() {
     loom::model(|| {
-        // Park two waits that repeat earlier only after consuming a notification
+        // Register two waits that repeat earlier only after consuming a notification
         let mut tester = TestClock::new();
         let clock = tester.clock();
         let earlier = clock.now() + Duration::from_secs(1);
@@ -449,10 +450,10 @@ fn test_consumed_notification_keeps_unreached_sibling_listed() {
                 })
             })
             .collect();
-        tester.wait_blocked(2);
+        tester.wait_registered(2);
         pair.1.notify_one();
         assert_eq!(reports.recv().unwrap(), Some(false));
-        tester.wait_blocked(2);
+        tester.wait_registered(2);
 
         // A rewait and a timeout distinguish a retained sibling from an early return
         *clock.paused.as_ref().unwrap().before_rewait.lock().unwrap() = Some(Box::new(move |_| {
@@ -478,7 +479,7 @@ fn test_consumed_notification_keeps_unreached_sibling_listed() {
 #[test]
 fn test_later_wait_cannot_take_pending_notification() {
     loom::model(|| {
-        // Reserve a notification for a parked wait held before its next check
+        // Reserve a notification for a registered wait held before its next check
         let mut tester = TestClock::new();
         let clock = tester.clock();
         let deadline = clock.now() + Duration::from_secs(1);
@@ -487,8 +488,8 @@ fn test_later_wait_cannot_take_pending_notification() {
             let waiter = waiter.clone();
             move || waiter.wait(Some(deadline))
         });
-        tester.wait_blocked(1);
-        let resume = hold_park(&clock, &waiter);
+        tester.wait_registered(1);
+        let resume = hold_wait(&clock, &waiter);
         waiter.signal.notify_one();
 
         // The later wait checks first after the advance and must leave that notification alone
@@ -496,7 +497,7 @@ fn test_later_wait_cannot_take_pending_notification() {
             let waiter = waiter.clone();
             move || waiter.wait(Some(deadline))
         });
-        tester.wait_blocked(2);
+        tester.wait_registered(2);
         tester.advance_to(deadline);
         assert!(!next.join().unwrap());
         resume.send(()).unwrap();
@@ -518,8 +519,8 @@ fn test_broadcast_then_single_notification_preserves_later_wait() {
             let waiter = waiter.clone();
             move || waiter.wait(Some(deadline))
         });
-        tester.wait_blocked(1);
-        let resume = hold_park(&clock, &waiter);
+        tester.wait_registered(1);
+        let resume = hold_wait(&clock, &waiter);
         waiter.signal.notify_all();
         waiter.signal.notify_one();
         resume.send(()).unwrap();
@@ -535,9 +536,96 @@ fn test_broadcast_then_single_notification_preserves_later_wait() {
             let waiter = waiter.clone();
             move || waiter.wait(Some(deadline))
         });
-        tester.wait_blocked(1);
+        tester.wait_registered(1);
         waiter.signal.notify_one();
         assert!(next.join().unwrap());
+        assert_idle(&tester, &clock);
+    });
+}
+
+/// A notified wait stays registered but prevents the clock from reporting parked workers.
+#[test]
+fn test_notification_prevents_parked_barrier_with_registered_wait() {
+    for broadcast in [false, true] {
+        loom::model(move || {
+            // Hold a timed worker before it can consume a notification
+            let mut tester = TestClock::new();
+            let clock = tester.clock();
+            let first = clock.now() + Duration::from_secs(1);
+            let next = clock.now() + Duration::from_secs(2);
+            let waiter = Arc::new(clock.waiter());
+            let waiting = thread::spawn({
+                let waiter = waiter.clone();
+                move || {
+                    assert!(waiter.wait(Some(first)));
+                    assert!(!waiter.wait(Some(next)));
+                }
+            });
+            tester.wait_registered(1);
+            let resume = hold_wait(&clock, &waiter);
+
+            // Keep the registration visible while the notification prevents the barrier
+            if broadcast {
+                waiter.signal.notify_all();
+            } else {
+                waiter.signal.notify_one();
+            }
+            assert_eq!(tester.next_deadline(), Some(first));
+            assert!(
+                !clock
+                    .paused
+                    .as_ref()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .parked(1)
+            );
+            resume.send(()).unwrap();
+            tester.wait_parked(1);
+            assert_eq!(tester.next_deadline(), Some(next));
+            tester.advance_to(next);
+            waiting.join().unwrap();
+            assert_idle(&tester, &clock);
+        });
+    }
+}
+
+/// A reached registration cannot satisfy the parked wait barrier before its thread runs.
+#[test]
+fn test_reached_wait_needs_new_registration_for_parked_barrier() {
+    loom::model(|| {
+        // Hold the first deadline wait until the driver has inspected expiry
+        let mut tester = TestClock::new();
+        let clock = tester.clock();
+        let first = clock.now() + Duration::from_secs(1);
+        let next = clock.now() + Duration::from_secs(2);
+        let waiter = Arc::new(clock.waiter());
+        let waiting = thread::spawn({
+            let waiter = waiter.clone();
+            move || {
+                assert!(!waiter.wait(Some(first)));
+                assert!(!waiter.wait(Some(next)));
+            }
+        });
+        tester.wait_registered(1);
+        let resume = hold_wait(&clock, &waiter);
+        tester.advance_to(first);
+        assert!(
+            !clock
+                .paused
+                .as_ref()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .parked(1)
+        );
+        resume.send(()).unwrap();
+        tester.wait_parked(1);
+        assert_eq!(tester.next_deadline(), Some(next));
+        tester.advance_to(next);
+        waiting.join().unwrap();
         assert_idle(&tester, &clock);
     });
 }
@@ -545,7 +633,7 @@ fn test_broadcast_then_single_notification_preserves_later_wait() {
 /// Reaches two independent signals with one advance, ordering wakes reproducibly.
 fn reached_signals_model(equal: bool, condvars: bool) {
     loom::model(move || {
-        // Let both waits park and list their deadlines before the advance collects them
+        // Let both waits register and list their deadlines before the advance collects them
         let mut tester = TestClock::new();
         let clock = tester.clock();
         let earlier = clock.now() + Duration::from_secs(1);
@@ -569,7 +657,7 @@ fn reached_signals_model(equal: bool, condvars: bool) {
                 })
             })
             .collect();
-        tester.wait_blocked(2);
+        tester.wait_registered(2);
 
         // One advance reaches both, regardless of their deadlines or allocation addresses
         tester.advance_to(later);

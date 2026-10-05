@@ -20,7 +20,7 @@ impl Clock {
     /// fires.
     ///
     /// Wait for a job or a timeout, driven from a test through `wait_timers`,
-    /// since `wait_blocked` cannot see a thread blocked in `select!`:
+    /// since `TestClock::wait_registered` cannot see a thread blocked in `select!`:
     ///
     /// ```
     /// # #[cfg(feature = "test-clock")] {
